@@ -3,7 +3,7 @@ import SwiftUI
 
 struct ContentView: View {
     @EnvironmentObject private var library: PluginLibraryViewModel
-    @AppStorage("pluginspector.theme") private var themeKey = PrototypeTheme.electric.rawValue
+    @AppStorage("pluginspector.theme") private var themeKey = PrototypeTheme.mint.rawValue
     @AppStorage("pluginspector.sidebarWidth") private var storedSidebarWidth = 250.0
 
     @State private var searchText = ""
@@ -14,7 +14,7 @@ struct ContentView: View {
     @State private var toast: ToastMessage?
 
     private var theme: PrototypeTheme {
-        PrototypeTheme(rawValue: themeKey) ?? .electric
+        PrototypeTheme(rawValue: themeKey) ?? .mint
     }
 
     private var filteredPlugins: [PluginRecord] {
