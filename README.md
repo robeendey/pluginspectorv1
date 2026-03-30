@@ -8,6 +8,14 @@ Small native macOS SwiftUI prototype that scans `/Library/Audio/Plug-Ins` and gi
 swift run
 ```
 
+## Package A One-Click App
+
+```bash
+./scripts/package-app.sh
+```
+
+That creates shareable artifacts in `dist/`.
+
 ## What It Shows
 
 - Plugin name
