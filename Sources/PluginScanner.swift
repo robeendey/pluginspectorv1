@@ -45,6 +45,8 @@ enum PluginFormat: String, CaseIterable, Identifiable {
 enum SidebarFilter: Hashable {
     case all
     case format(PluginFormat)
+    case vendor(String)
+    case folder(String)
 
     var title: String {
         switch self {
@@ -52,6 +54,10 @@ enum SidebarFilter: Hashable {
             "All Plugins"
         case .format(let format):
             format.rawValue
+        case .vendor(let vendor):
+            vendor
+        case .folder(let folder):
+            folder
         }
     }
 }
@@ -327,6 +333,10 @@ final class PluginLibraryViewModel: ObservableObject {
             plugins.count
         case .format(let format):
             plugins.filter { $0.format == format }.count
+        case .vendor(let vendor):
+            plugins.filter { $0.displayVendor == vendor }.count
+        case .folder(let folder):
+            plugins.filter { $0.rootFolderName == folder }.count
         }
     }
 }

@@ -10,7 +10,6 @@ struct PluginSpectorApp: App {
                 .environmentObject(library)
                 .frame(minWidth: 1180, minHeight: 760)
         }
-        .windowResizability(.contentSize)
 
         Settings {
             VStack(alignment: .leading, spacing: 12) {
