@@ -5,12 +5,14 @@ struct DashboardSnapshot {
     let filteredManufacturerCounts: [(String, Int)]
     let filteredFormatCounts: [(PluginFormat, Int)]
     let filteredFolderCounts: [(String, Int)]
+    let filteredCompatibilityCounts: [(PluginCompatibility.Verdict, Int)]
     let hasSidebarMatches: Bool
     let totalCount: Int
     let visibleCount: Int
     let manufacturerCounts: [(String, Int)]
     let folderCounts: [(String, Int)]
     let formatCounts: [(PluginFormat, Int)]
+    let compatibilityCounts: [(PluginCompatibility.Verdict, Int)]
     let totalPackageSizeDescription: String
     let selectedPlugin: PluginRecord?
     let selectedCount: Int
@@ -23,12 +25,14 @@ struct DashboardSnapshot {
         filteredManufacturerCounts: [],
         filteredFormatCounts: [],
         filteredFolderCounts: [],
+        filteredCompatibilityCounts: [],
         hasSidebarMatches: false,
         totalCount: 0,
         visibleCount: 0,
         manufacturerCounts: [],
         folderCounts: [],
         formatCounts: [],
+        compatibilityCounts: [],
         totalPackageSizeDescription: ByteCountFormatter.string(fromByteCount: 0, countStyle: .file),
         selectedPlugin: nil,
         selectedCount: 0,
@@ -41,6 +45,10 @@ struct DashboardSnapshot {
 @MainActor
 final class DashboardSnapshotModel: ObservableObject {
     @Published private(set) var snapshot: DashboardSnapshot = .empty
+    private var cachedAggregates: Aggregates?
+    private var cachedPluginStorageID: UInt?
+    private var multiFormatTask: Task<Void, Never>?
+    private var multiFormatRequestID: UInt = 0
 
     func rebuild(
         plugins: [PluginRecord],
@@ -48,8 +56,9 @@ final class DashboardSnapshotModel: ObservableObject {
         searchText: String,
         sidebarSearchText: String,
         sortOption: PluginSortOption,
-        selectedPluginID: PluginRecord.ID?
+        selectedPluginIDs: Set<PluginRecord.ID>
     ) {
+        let rebuildStartedAt = CFAbsoluteTimeGetCurrent()
         let scopedPlugins: [PluginRecord]
         switch selectedFilter {
         case .all:
@@ -60,6 +69,8 @@ final class DashboardSnapshotModel: ObservableObject {
             scopedPlugins = plugins.filter { $0.displayVendor == vendor }
         case .folder(let folder):
             scopedPlugins = plugins.filter { $0.rootFolderName == folder }
+        case .compatibility(let verdict):
+            scopedPlugins = plugins.filter { $0.compatibility.verdict == verdict }
         }
 
         let trimmedSearch = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -83,41 +94,70 @@ final class DashboardSnapshotModel: ObservableObject {
             visibleVendors.insert(plugin.displayVendor)
         }
 
-        let selectedPlugin = selectedPluginID.flatMap { id in
+        let selectedPlugin = selectedPluginIDs.first.flatMap { id in
             filteredPlugins.first(where: { $0.id == id })
         }
-        let selectedCount = selectedPlugin == nil ? 0 : 1
+        let selectedCount = filteredPlugins.filter { selectedPluginIDs.contains($0.id) }.count
 
-        let aggregates = buildAggregates(for: plugins)
+        let aggregates = aggregates(for: plugins)
         let sidebarQuery = sidebarSearchText.trimmingCharacters(in: .whitespacesAndNewlines).normalizedSearchKey
         let filteredManufacturerCounts = filterSidebarCounts(aggregates.manufacturerCounts, query: sidebarQuery)
         let filteredFormatCounts = filterSidebarCounts(aggregates.formatCounts, query: sidebarQuery)
         let filteredFolderCounts = filterSidebarCounts(aggregates.folderCounts, query: sidebarQuery)
-        let hasSidebarMatches = !filteredManufacturerCounts.isEmpty || !filteredFormatCounts.isEmpty || !filteredFolderCounts.isEmpty
-
-        let multiFormatPluginIDs: Set<PluginRecord.ID> = Set(
-            PluginGrouping.collapse(filteredPlugins)
-                .filter(\.isMultiFormat)
-                .flatMap { $0.variants.map(\.id) }
-        )
+        let filteredCompatibilityCounts = filterSidebarCounts(aggregates.compatibilityCounts, query: sidebarQuery)
+        let hasSidebarMatches = !filteredManufacturerCounts.isEmpty || !filteredFormatCounts.isEmpty || !filteredFolderCounts.isEmpty || !filteredCompatibilityCounts.isEmpty
 
         snapshot = DashboardSnapshot(
             filteredPlugins: filteredPlugins,
             filteredManufacturerCounts: filteredManufacturerCounts,
             filteredFormatCounts: filteredFormatCounts,
             filteredFolderCounts: filteredFolderCounts,
+            filteredCompatibilityCounts: filteredCompatibilityCounts,
             hasSidebarMatches: hasSidebarMatches,
             totalCount: plugins.count,
             visibleCount: visibleCount,
             manufacturerCounts: aggregates.manufacturerCounts,
             folderCounts: aggregates.folderCounts,
             formatCounts: aggregates.formatCounts,
+            compatibilityCounts: aggregates.compatibilityCounts,
             totalPackageSizeDescription: aggregates.totalPackageSizeDescription,
             selectedPlugin: selectedPlugin,
             selectedCount: selectedCount,
             visibleFormatCount: visibleFormats.count,
             visibleVendorCount: visibleVendors.count,
-            multiFormatPluginIDs: multiFormatPluginIDs
+            multiFormatPluginIDs: []
+        )
+        let elapsed = (CFAbsoluteTimeGetCurrent() - rebuildStartedAt) * 1000
+        PerformanceTrace.log("Dashboard rebuild: \(plugins.count) plugins -> \(visibleCount) visible in \(String(format: "%.1f", elapsed))ms")
+
+        scheduleMultiFormatComputation(for: filteredPlugins)
+    }
+
+    func updateSelection(selectedPluginIDs: Set<PluginRecord.ID>) {
+        let selectedPlugin = selectedPluginIDs.first.flatMap { id in
+            snapshot.filteredPlugins.first(where: { $0.id == id })
+        }
+        let selectedCount = snapshot.filteredPlugins.filter { selectedPluginIDs.contains($0.id) }.count
+
+        snapshot = DashboardSnapshot(
+            filteredPlugins: snapshot.filteredPlugins,
+            filteredManufacturerCounts: snapshot.filteredManufacturerCounts,
+            filteredFormatCounts: snapshot.filteredFormatCounts,
+            filteredFolderCounts: snapshot.filteredFolderCounts,
+            filteredCompatibilityCounts: snapshot.filteredCompatibilityCounts,
+            hasSidebarMatches: snapshot.hasSidebarMatches,
+            totalCount: snapshot.totalCount,
+            visibleCount: snapshot.visibleCount,
+            manufacturerCounts: snapshot.manufacturerCounts,
+            folderCounts: snapshot.folderCounts,
+            formatCounts: snapshot.formatCounts,
+            compatibilityCounts: snapshot.compatibilityCounts,
+            totalPackageSizeDescription: snapshot.totalPackageSizeDescription,
+            selectedPlugin: selectedPlugin,
+            selectedCount: selectedCount,
+            visibleFormatCount: snapshot.visibleFormatCount,
+            visibleVendorCount: snapshot.visibleVendorCount,
+            multiFormatPluginIDs: snapshot.multiFormatPluginIDs
         )
     }
 
@@ -125,19 +165,37 @@ final class DashboardSnapshotModel: ObservableObject {
         let manufacturerCounts: [(String, Int)]
         let folderCounts: [(String, Int)]
         let formatCounts: [(PluginFormat, Int)]
+        let compatibilityCounts: [(PluginCompatibility.Verdict, Int)]
         let totalPackageSizeDescription: String
+    }
+
+    private func aggregates(for plugins: [PluginRecord]) -> Aggregates {
+        let storageID = pluginStorageID(for: plugins)
+        if cachedPluginStorageID == storageID, let cachedAggregates {
+            return cachedAggregates
+        }
+
+        let startedAt = CFAbsoluteTimeGetCurrent()
+        let rebuilt = buildAggregates(for: plugins)
+        cachedPluginStorageID = storageID
+        cachedAggregates = rebuilt
+        let elapsed = (CFAbsoluteTimeGetCurrent() - startedAt) * 1000
+        PerformanceTrace.log("Dashboard aggregates: \(plugins.count) plugins in \(String(format: "%.1f", elapsed))ms")
+        return rebuilt
     }
 
     private func buildAggregates(for plugins: [PluginRecord]) -> Aggregates {
         var vendorCounts: [String: Int] = [:]
         var folderCounts: [String: Int] = [:]
         var formatCounts: [PluginFormat: Int] = [:]
+        var compatibilityCounts: [PluginCompatibility.Verdict: Int] = [:]
         var totalBytes: Int64 = 0
 
         for plugin in plugins {
             vendorCounts[plugin.displayVendor, default: 0] += 1
             folderCounts[plugin.rootFolderName, default: 0] += 1
             formatCounts[plugin.format, default: 0] += 1
+            compatibilityCounts[plugin.compatibility.verdict, default: 0] += 1
             totalBytes += plugin.packageSizeBytes
         }
 
@@ -149,6 +207,15 @@ final class DashboardSnapshotModel: ObservableObject {
                 let count = formatCounts[format, default: 0]
                 return count > 0 ? (format, count) : nil
             }
+        let compatibilityCountsSorted = [
+            PluginCompatibility.Verdict.legacy32Bit,
+            .rosetta,
+            .unknown,
+            .native,
+        ].compactMap { verdict -> (PluginCompatibility.Verdict, Int)? in
+            let count = compatibilityCounts[verdict, default: 0]
+            return count > 0 ? (verdict, count) : nil
+        }
 
         let totalPackageSizeDescription = ByteCountFormatter.string(fromByteCount: totalBytes, countStyle: .file)
 
@@ -156,6 +223,7 @@ final class DashboardSnapshotModel: ObservableObject {
             manufacturerCounts: manufacturerCounts,
             folderCounts: folderCountsSorted,
             formatCounts: formatCountsSorted,
+            compatibilityCounts: compatibilityCountsSorted,
             totalPackageSizeDescription: totalPackageSizeDescription
         )
     }
@@ -191,10 +259,63 @@ final class DashboardSnapshotModel: ObservableObject {
         switch item {
         case let format as PluginFormat:
             format.rawValue
+        case let verdict as PluginCompatibility.Verdict:
+            verdict.title
         case let string as String:
             string
         default:
             ""
+        }
+    }
+
+    private func pluginStorageID(for plugins: [PluginRecord]) -> UInt {
+        plugins.withUnsafeBufferPointer { buffer in
+            UInt(bitPattern: buffer.baseAddress)
+        } ^ UInt(plugins.count)
+    }
+
+    private func scheduleMultiFormatComputation(for filteredPlugins: [PluginRecord]) {
+        multiFormatTask?.cancel()
+        guard !filteredPlugins.isEmpty else { return }
+
+        multiFormatRequestID &+= 1
+        let requestID = multiFormatRequestID
+        let collapseInput = filteredPlugins
+
+        multiFormatTask = Task {
+            let collapseStartedAt = CFAbsoluteTimeGetCurrent()
+            let multiFormatPluginIDs: Set<PluginRecord.ID> = await Task.detached(priority: .utility) {
+                Set(
+                    PluginGrouping.collapse(collapseInput)
+                        .filter(\.isMultiFormat)
+                        .flatMap { $0.variants.map(\.id) }
+                )
+            }.value
+            let collapseElapsed = (CFAbsoluteTimeGetCurrent() - collapseStartedAt) * 1000
+            PerformanceTrace.log("Dashboard multi-format collapse: \(collapseInput.count) plugins in \(String(format: "%.1f", collapseElapsed))ms")
+
+            guard !Task.isCancelled, requestID == multiFormatRequestID else { return }
+
+            snapshot = DashboardSnapshot(
+                filteredPlugins: snapshot.filteredPlugins,
+                filteredManufacturerCounts: snapshot.filteredManufacturerCounts,
+                filteredFormatCounts: snapshot.filteredFormatCounts,
+                filteredFolderCounts: snapshot.filteredFolderCounts,
+                filteredCompatibilityCounts: snapshot.filteredCompatibilityCounts,
+                hasSidebarMatches: snapshot.hasSidebarMatches,
+                totalCount: snapshot.totalCount,
+                visibleCount: snapshot.visibleCount,
+                manufacturerCounts: snapshot.manufacturerCounts,
+                folderCounts: snapshot.folderCounts,
+                formatCounts: snapshot.formatCounts,
+                compatibilityCounts: snapshot.compatibilityCounts,
+                totalPackageSizeDescription: snapshot.totalPackageSizeDescription,
+                selectedPlugin: snapshot.selectedPlugin,
+                selectedCount: snapshot.selectedCount,
+                visibleFormatCount: snapshot.visibleFormatCount,
+                visibleVendorCount: snapshot.visibleVendorCount,
+                multiFormatPluginIDs: multiFormatPluginIDs
+            )
         }
     }
 }

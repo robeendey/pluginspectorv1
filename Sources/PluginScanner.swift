@@ -1,6 +1,9 @@
 import Foundation
 
-let defaultPluginRoot = URL(fileURLWithPath: "/Library/Audio/Plug-Ins", isDirectory: true)
+let defaultPluginRoots: [URL] = [
+    URL(fileURLWithPath: "/Library/Audio/Plug-Ins", isDirectory: true),
+    URL(fileURLWithPath: "/Library/Application Support/Avid/Audio/Plug-Ins", isDirectory: true),
+]
 
 struct PluginCompatibility: Codable, Hashable, Sendable {
     enum Verdict: String, Codable, Hashable, Sendable {
@@ -8,6 +11,32 @@ struct PluginCompatibility: Codable, Hashable, Sendable {
         case rosetta = "Requires Rosetta"
         case legacy32Bit = "Legacy 32-bit"
         case unknown = "Unknown"
+
+        var title: String {
+            switch self {
+            case .native:
+                return "Native"
+            case .rosetta:
+                return "Requires Rosetta"
+            case .legacy32Bit:
+                return "Will Never Work"
+            case .unknown:
+                return "Unknown"
+            }
+        }
+
+        var subtitle: String {
+            switch self {
+            case .native:
+                return "Works on this Mac without translation"
+            case .rosetta:
+                return "May still work, but only through Rosetta"
+            case .legacy32Bit:
+                return "Legacy 32-bit or not runnable on current macOS"
+            case .unknown:
+                return "Needs manual review"
+            }
+        }
     }
 
     let verdict: Verdict
@@ -64,6 +93,7 @@ enum SidebarFilter: Hashable {
     case format(PluginFormat)
     case vendor(String)
     case folder(String)
+    case compatibility(PluginCompatibility.Verdict)
 
     var title: String {
         switch self {
@@ -75,12 +105,16 @@ enum SidebarFilter: Hashable {
             vendor
         case .folder(let folder):
             folder
+        case .compatibility(let verdict):
+            verdict.title
         }
     }
 }
 
 struct PluginRecord: Codable, Identifiable, Hashable, Sendable {
     let bundleURL: URL
+    let scanRootPath: String
+    let scanRootLabel: String
     let name: String
     let format: PluginFormat
     let vendor: String?
@@ -109,6 +143,46 @@ struct PluginRecord: Codable, Identifiable, Hashable, Sendable {
         return componentNames.joined(separator: ", ")
     }
 
+    init(
+        bundleURL: URL,
+        scanRootPath: String,
+        scanRootLabel: String,
+        name: String,
+        format: PluginFormat,
+        vendor: String?,
+        version: String?,
+        bundleIdentifier: String?,
+        executableName: String?,
+        minimumSystemVersion: String?,
+        rootFolderName: String,
+        relativeLocation: String,
+        modifiedAt: Date?,
+        componentNames: [String],
+        packageExtension: String,
+        packageSizeBytes: Int64,
+        compatibility: PluginCompatibility,
+        searchIndex: String
+    ) {
+        self.bundleURL = bundleURL
+        self.scanRootPath = scanRootPath
+        self.scanRootLabel = scanRootLabel
+        self.name = name
+        self.format = format
+        self.vendor = vendor
+        self.version = version
+        self.bundleIdentifier = bundleIdentifier
+        self.executableName = executableName
+        self.minimumSystemVersion = minimumSystemVersion
+        self.rootFolderName = rootFolderName
+        self.relativeLocation = relativeLocation
+        self.modifiedAt = modifiedAt
+        self.componentNames = componentNames
+        self.packageExtension = packageExtension
+        self.packageSizeBytes = packageSizeBytes
+        self.compatibility = compatibility
+        self.searchIndex = searchIndex
+    }
+
     static func buildSearchIndex(
         name: String,
         displayVendor: String,
@@ -132,6 +206,170 @@ struct PluginRecord: Codable, Identifiable, Hashable, Sendable {
         .joined(separator: "\n")
         .normalizedSearchKey
     }
+
+    private enum CodingKeys: String, CodingKey {
+        case bundleURL
+        case scanRootPath
+        case scanRootLabel
+        case name
+        case format
+        case vendor
+        case version
+        case bundleIdentifier
+        case executableName
+        case minimumSystemVersion
+        case rootFolderName
+        case relativeLocation
+        case modifiedAt
+        case componentNames
+        case packageExtension
+        case packageSizeBytes
+        case compatibility
+        case searchIndex
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+
+        let bundleURL = try container.decode(URL.self, forKey: .bundleURL)
+        let format = try container.decode(PluginFormat.self, forKey: .format)
+        let vendor = try container.decodeIfPresent(String.self, forKey: .vendor)
+        let version = try container.decodeIfPresent(String.self, forKey: .version)
+        let bundleIdentifier = try container.decodeIfPresent(String.self, forKey: .bundleIdentifier)
+        let executableName = try container.decodeIfPresent(String.self, forKey: .executableName)
+        let minimumSystemVersion = try container.decodeIfPresent(String.self, forKey: .minimumSystemVersion)
+        let rootFolderName = try container.decode(String.self, forKey: .rootFolderName)
+        let relativeLocation = try container.decode(String.self, forKey: .relativeLocation)
+        let modifiedAt = try container.decodeIfPresent(Date.self, forKey: .modifiedAt)
+        let componentNames = try container.decode([String].self, forKey: .componentNames)
+        let packageExtension = try container.decode(String.self, forKey: .packageExtension)
+        let packageSizeBytes = try container.decode(Int64.self, forKey: .packageSizeBytes)
+        let compatibility = try container.decodeIfPresent(PluginCompatibility.self, forKey: .compatibility)
+            ?? PluginCompatibility(verdict: .unknown, summary: "Unknown", reason: "Loaded from an older cache snapshot.")
+        let scanRootPath = try container.decodeIfPresent(String.self, forKey: .scanRootPath)
+            ?? Self.inferredScanRootPath(for: bundleURL, format: format)
+        let scanRootLabel = try container.decodeIfPresent(String.self, forKey: .scanRootLabel)
+            ?? Self.scanRootLabel(for: scanRootPath)
+        let name = try container.decode(String.self, forKey: .name)
+        let normalizedRootFolderName = Self.normalizedFolderGrouping(
+            storedRootFolderName: rootFolderName,
+            relativeLocation: relativeLocation,
+            scanRootPath: scanRootPath,
+            scanRootLabel: scanRootLabel
+        )
+        let searchIndex = Self.buildSearchIndex(
+            name: name,
+            displayVendor: vendor ?? "Unknown vendor",
+            displayVersion: version ?? "Unknown",
+            rootFolderName: normalizedRootFolderName,
+            relativeLocation: relativeLocation,
+            bundleIdentifier: bundleIdentifier,
+            componentSummary: componentNames.isEmpty ? "None reported" : componentNames.joined(separator: ", "),
+            compatibility: compatibility
+        )
+
+        self.init(
+            bundleURL: bundleURL,
+            scanRootPath: scanRootPath,
+            scanRootLabel: scanRootLabel,
+            name: name,
+            format: format,
+            vendor: vendor,
+            version: version,
+            bundleIdentifier: bundleIdentifier,
+            executableName: executableName,
+            minimumSystemVersion: minimumSystemVersion,
+            rootFolderName: normalizedRootFolderName,
+            relativeLocation: relativeLocation,
+            modifiedAt: modifiedAt,
+            componentNames: componentNames,
+            packageExtension: packageExtension,
+            packageSizeBytes: packageSizeBytes,
+            compatibility: compatibility,
+            searchIndex: searchIndex
+        )
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(bundleURL, forKey: .bundleURL)
+        try container.encode(scanRootPath, forKey: .scanRootPath)
+        try container.encode(scanRootLabel, forKey: .scanRootLabel)
+        try container.encode(name, forKey: .name)
+        try container.encode(format, forKey: .format)
+        try container.encodeIfPresent(vendor, forKey: .vendor)
+        try container.encodeIfPresent(version, forKey: .version)
+        try container.encodeIfPresent(bundleIdentifier, forKey: .bundleIdentifier)
+        try container.encodeIfPresent(executableName, forKey: .executableName)
+        try container.encodeIfPresent(minimumSystemVersion, forKey: .minimumSystemVersion)
+        try container.encode(rootFolderName, forKey: .rootFolderName)
+        try container.encode(relativeLocation, forKey: .relativeLocation)
+        try container.encodeIfPresent(modifiedAt, forKey: .modifiedAt)
+        try container.encode(componentNames, forKey: .componentNames)
+        try container.encode(packageExtension, forKey: .packageExtension)
+        try container.encode(packageSizeBytes, forKey: .packageSizeBytes)
+        try container.encode(compatibility, forKey: .compatibility)
+        try container.encode(searchIndex, forKey: .searchIndex)
+    }
+
+    private static func inferredScanRootPath(for bundleURL: URL, format: PluginFormat) -> String {
+        if format == .aax || bundleURL.path.contains("/Library/Application Support/Avid/Audio/Plug-Ins") {
+            return "/Library/Application Support/Avid/Audio/Plug-Ins"
+        }
+        return "/Library/Audio/Plug-Ins"
+    }
+
+    private static func scanRootLabel(for scanRootPath: String) -> String {
+        switch scanRootPath {
+        case "/Library/Audio/Plug-Ins":
+            return "Audio Plug-Ins"
+        case "/Library/Application Support/Avid/Audio/Plug-Ins":
+            return "AAX Plug-Ins"
+        default:
+            return URL(fileURLWithPath: scanRootPath, isDirectory: true).lastPathComponent
+        }
+    }
+
+    private static func normalizedFolderGrouping(
+        storedRootFolderName: String,
+        relativeLocation: String,
+        scanRootPath: String,
+        scanRootLabel: String
+    ) -> String {
+        let corrected = normalizedFolderGrouping(relativeLocation: relativeLocation, scanRootPath: scanRootPath, scanRootLabel: scanRootLabel)
+        if corrected == scanRootLabel || corrected != storedRootFolderName {
+            return corrected
+        }
+        return storedRootFolderName
+    }
+
+    private static func normalizedFolderGrouping(
+        relativeLocation: String,
+        scanRootPath: String,
+        scanRootLabel: String
+    ) -> String {
+        let components = relativeLocation.split(separator: "/").map(String.init)
+        guard !components.isEmpty else { return scanRootLabel }
+
+        let containerNames: Set<String>
+        switch scanRootPath {
+        case "/Library/Audio/Plug-Ins":
+            containerNames = ["components", "vst", "vst2", "vst2 custom", "vst3", "mas"]
+        case "/Library/Application Support/Avid/Audio/Plug-Ins":
+            containerNames = []
+        default:
+            containerNames = []
+        }
+
+        if let firstMeaningful = components.first(where: { !containerNames.contains($0.lowercased()) }) {
+            if firstMeaningful == components.last, firstMeaningful.contains(".") {
+                return scanRootLabel
+            }
+            return firstMeaningful
+        }
+
+        return scanRootLabel
+    }
 }
 
 enum PluginScannerError: LocalizedError {
@@ -153,37 +391,46 @@ enum PluginLibraryScanner {
         "aaxplugin",
     ]
     private static let packageSizeCache = PackageSizeCache()
+    private static let compatibilityCache = PluginCompatibilityCache()
 
-    static func scan(root: URL) throws -> [PluginRecord] {
-        var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: root.path, isDirectory: &isDirectory), isDirectory.boolValue else {
-            throw PluginScannerError.missingRoot(root)
-        }
-
-        guard let enumerator = FileManager.default.enumerator(
-            at: root,
-            includingPropertiesForKeys: [
-                .contentModificationDateKey,
-            ],
-            options: [.skipsHiddenFiles],
-            errorHandler: { _, _ in
-                true
-            }
-        ) else {
-            return []
-        }
-
+    static func scan(roots: [URL]) throws -> [PluginRecord] {
+        let startedAt = CFAbsoluteTimeGetCurrent()
         var records: [PluginRecord] = []
+        var enumeratedBundleCount = 0
 
-        for case let bundleURL as URL in enumerator {
-            let fileExtension = bundleURL.pathExtension.lowercased()
-            guard supportedExtensions.contains(fileExtension) else { continue }
+        for root in roots {
+            var isDirectory: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: root.path, isDirectory: &isDirectory), isDirectory.boolValue else {
+                continue
+            }
 
-            records.append(loadPluginRecord(at: bundleURL, root: root))
-            enumerator.skipDescendants()
+            guard let enumerator = FileManager.default.enumerator(
+                at: root,
+                includingPropertiesForKeys: [
+                    .contentModificationDateKey,
+                ],
+                options: [.skipsHiddenFiles],
+                errorHandler: { _, _ in
+                    true
+                }
+            ) else {
+                continue
+            }
+
+            for case let bundleURL as URL in enumerator {
+                let fileExtension = bundleURL.pathExtension.lowercased()
+                guard supportedExtensions.contains(fileExtension) else { continue }
+
+                enumeratedBundleCount += 1
+                records.append(loadPluginRecord(at: bundleURL, root: root))
+                enumerator.skipDescendants()
+            }
         }
 
         packageSizeCache.saveIfNeeded()
+        compatibilityCache.saveIfNeeded()
+        let elapsed = (CFAbsoluteTimeGetCurrent() - startedAt) * 1000
+        PerformanceTrace.log("Scan finished: \(records.count) records from \(roots.count) roots, \(enumeratedBundleCount) bundles, \(String(format: "%.1f", elapsed))ms")
         return records
     }
 
@@ -202,14 +449,16 @@ enum PluginLibraryScanner {
         let version = (infoDictionary["CFBundleShortVersionString"] as? String) ?? (infoDictionary["CFBundleVersion"] as? String)
         let modifiedAt = try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
         let componentNames = componentNames(from: infoDictionary)
-        let rootFolder = rootFolderName(for: url, root: root)
         let relativePath = relativeLocation(for: url, root: root)
+        let scanRootPath = root.path
+        let scanRootLabel = scanRootLabel(for: root)
+        let rootFolder = folderGrouping(relativeLocation: relativePath, scanRootPath: scanRootPath)
         let rawVendor = inferVendor(for: url, bundleIdentifier: bundleIdentifier, info: infoDictionary)
         let vendor = rawVendor.map { PluginLibraryScanner.sanitizedManufacturer($0) }
         let displayVendor = vendor ?? "Unknown vendor"
         let displayVersion = version ?? "Unknown"
         let componentSummary = componentNames.isEmpty ? "None reported" : componentNames.joined(separator: ", ")
-        let compatibility = compatibility(for: url, info: infoDictionary)
+        let compatibility = compatibility(for: url, info: infoDictionary, modifiedAt: modifiedAt)
         let searchIndex = PluginRecord.buildSearchIndex(
             name: name,
             displayVendor: displayVendor,
@@ -223,6 +472,8 @@ enum PluginLibraryScanner {
 
         return PluginRecord(
             bundleURL: url,
+            scanRootPath: scanRootPath,
+            scanRootLabel: scanRootLabel,
             name: name,
             format: PluginFormat.detect(from: url),
             vendor: vendor,
@@ -262,31 +513,41 @@ enum PluginLibraryScanner {
         return url.deletingPathExtension().lastPathComponent
     }
 
-    private static func compatibility(for bundleURL: URL, info: [String: Any]) -> PluginCompatibility {
+    private static func compatibility(for bundleURL: URL, info: [String: Any], modifiedAt: Date?) -> PluginCompatibility {
+        if let cached = compatibilityCache.compatibility(for: bundleURL, modificationDate: modifiedAt) {
+            return cached
+        }
+
         let hostArchitecture = ProcessInfo.processInfo.machineArchitecture
 
         guard let executableURL = bundleExecutableURL(for: bundleURL, info: info) else {
-            return PluginCompatibility(
+            let compatibility = PluginCompatibility(
                 verdict: .unknown,
                 summary: "Unknown",
                 reason: "No executable was reported for this bundle."
             )
+            compatibilityCache.store(compatibility, for: bundleURL, modificationDate: modifiedAt)
+            return compatibility
         }
 
         guard let architectureInfo = executableArchitecture(for: executableURL) else {
-            return PluginCompatibility(
+            let compatibility = PluginCompatibility(
                 verdict: .unknown,
                 summary: "Unknown",
                 reason: "Could not inspect the plugin binary architecture."
             )
+            compatibilityCache.store(compatibility, for: bundleURL, modificationDate: modifiedAt)
+            return compatibility
         }
 
         if architectureInfo.isLegacy32BitOnly {
-            return PluginCompatibility(
+            let compatibility = PluginCompatibility(
                 verdict: .legacy32Bit,
                 summary: "Not runnable",
                 reason: "This bundle only contains 32-bit executable slices, which modern macOS cannot load."
             )
+            compatibilityCache.store(compatibility, for: bundleURL, modificationDate: modifiedAt)
+            return compatibility
         }
 
         let minimumVersion = info["LSMinimumSystemVersion"] as? String
@@ -297,26 +558,32 @@ enum PluginLibraryScanner {
                 "Contains a \(hostArchitecture) slice and reports a minimum macOS version of \($0)."
             } ?? "Contains a \(hostArchitecture) slice for this Mac."
 
-            return PluginCompatibility(
+            let compatibility = PluginCompatibility(
                 verdict: .native,
                 summary: summary,
                 reason: reason
             )
+            compatibilityCache.store(compatibility, for: bundleURL, modificationDate: modifiedAt)
+            return compatibility
         }
 
         if hostArchitecture == "arm64", architectureInfo.architectures.contains("x86_64") {
-            return PluginCompatibility(
+            let compatibility = PluginCompatibility(
                 verdict: .rosetta,
                 summary: "Intel-only",
                 reason: "This bundle has an Intel slice but no arm64 slice, so it would require Rosetta on Apple Silicon."
             )
+            compatibilityCache.store(compatibility, for: bundleURL, modificationDate: modifiedAt)
+            return compatibility
         }
 
-        return PluginCompatibility(
+        let compatibility = PluginCompatibility(
             verdict: .unknown,
             summary: architectureInfo.architectures.map { $0.uppercased() }.joined(separator: " / "),
             reason: "The detected architectures do not clearly map to a supported verdict for this Mac."
         )
+        compatibilityCache.store(compatibility, for: bundleURL, modificationDate: modifiedAt)
+        return compatibility
     }
 
     private static func bundleExecutableURL(for bundleURL: URL, info: [String: Any]) -> URL? {
@@ -504,14 +771,54 @@ enum PluginLibraryScanner {
         return nil
     }
 
-    private static func rootFolderName(for url: URL, root: URL) -> String {
-        let relativeComponents = url.path.replacingOccurrences(of: root.path + "/", with: "").split(separator: "/")
-        return relativeComponents.first.map(String.init) ?? root.lastPathComponent
-    }
-
     private static func relativeLocation(for url: URL, root: URL) -> String {
         let relativePath = url.path.replacingOccurrences(of: root.path + "/", with: "")
         return relativePath
+    }
+
+    private static func folderGrouping(relativeLocation: String, scanRootPath: String) -> String {
+        let components = relativeLocation.split(separator: "/").map(String.init)
+        let scanRootLabel = scanRootLabel(for: scanRootPath)
+        guard !components.isEmpty else { return scanRootLabel }
+
+        let containerNames = Set(formatContainerNames(for: scanRootPath))
+
+        if let firstMeaningful = components.first(where: { !containerNames.contains($0.lowercased()) }) {
+            if firstMeaningful == components.last, firstMeaningful.contains(".") {
+                return scanRootLabel
+            }
+            return firstMeaningful
+        }
+
+        return scanRootLabel
+    }
+
+    private static func formatContainerNames(for scanRootPath: String) -> [String] {
+        switch scanRootPath {
+        case "/Library/Audio/Plug-Ins":
+            return ["components", "vst", "vst2", "vst2 custom", "vst3", "mas"]
+        case "/Library/Application Support/Avid/Audio/Plug-Ins":
+            return []
+        default:
+            return []
+        }
+    }
+
+    private static func scanRootLabel(for root: URL) -> String {
+        let standardizedPath = root.standardizedFileURL.path
+        return scanRootLabel(for: standardizedPath)
+    }
+
+    private static func scanRootLabel(for scanRootPath: String) -> String {
+        let standardizedPath = URL(fileURLWithPath: scanRootPath, isDirectory: true).standardizedFileURL.path
+        switch standardizedPath {
+        case "/Library/Audio/Plug-Ins":
+            return "Audio Plug-Ins"
+        case "/Library/Application Support/Avid/Audio/Plug-Ins":
+            return "AAX Plug-Ins"
+        default:
+            return URL(fileURLWithPath: standardizedPath, isDirectory: true).lastPathComponent
+        }
     }
 }
 
@@ -522,7 +829,7 @@ final class PluginLibraryViewModel: ObservableObject {
         case background
     }
 
-    static let defaultRoot = defaultPluginRoot
+    static let defaultRoots = defaultPluginRoots
 
     @Published private(set) var plugins: [PluginRecord] = []
     @Published private(set) var lastScanDuration: TimeInterval?
@@ -532,17 +839,17 @@ final class PluginLibraryViewModel: ObservableObject {
     @Published private(set) var isRefreshingInBackground = false
     @Published var scanError: String?
     @Published var selectedFilter: SidebarFilter = .all
-    @Published var selectedPluginID: PluginRecord.ID?
+    @Published var selectedPluginIDs: Set<PluginRecord.ID> = []
 
-    let rootURL: URL
+    let rootURLs: [URL]
     private let snapshotStore: PluginSnapshotStore
     private var hasStartedInitialRefresh = false
 
-    init(rootURL: URL = defaultPluginRoot, snapshotStore: PluginSnapshotStore = PluginSnapshotStore()) {
-        self.rootURL = rootURL
+    init(rootURLs: [URL] = defaultPluginRoots, snapshotStore: PluginSnapshotStore = PluginSnapshotStore()) {
+        self.rootURLs = rootURLs
         self.snapshotStore = snapshotStore
 
-        if let snapshot = snapshotStore.load(rootURL: rootURL) {
+        if let snapshot = snapshotStore.load(rootURLs: rootURLs) {
             self.plugins = snapshot.plugins
             self.lastScannedAt = snapshot.lastScannedAt
             self.lastScanDuration = snapshot.lastScanDuration
@@ -558,7 +865,7 @@ final class PluginLibraryViewModel: ObservableObject {
     func scan(presentation: ScanPresentation = .foreground) {
         guard !isScanning else { return }
 
-        let rootURL = rootURL
+        let rootURLs = rootURLs
         isScanning = true
         isForegroundScanning = presentation == .foreground
         isRefreshingInBackground = presentation == .background
@@ -569,7 +876,7 @@ final class PluginLibraryViewModel: ObservableObject {
 
             do {
                 let records = try await Task.detached(priority: .userInitiated) {
-                    try PluginLibraryScanner.scan(root: rootURL)
+                    try PluginLibraryScanner.scan(roots: rootURLs)
                 }.value
 
                 plugins = records
@@ -577,16 +884,15 @@ final class PluginLibraryViewModel: ObservableObject {
                 lastScanDuration = Date().timeIntervalSince(startDate)
                 snapshotStore.save(
                     PluginLibrarySnapshot(
-                        rootPath: rootURL.standardizedFileURL.path,
+                        rootPaths: rootURLs.map { $0.standardizedFileURL.path }.sorted(),
                         plugins: records,
                         lastScannedAt: lastScannedAt,
                         lastScanDuration: lastScanDuration
                     )
                 )
 
-                if !records.contains(where: { $0.id == selectedPluginID }) {
-                    selectedPluginID = nil
-                }
+                let validIDs = Set(records.map(\.id))
+                selectedPluginIDs = selectedPluginIDs.intersection(validIDs)
             } catch {
                 scanError = error.localizedDescription
             }
@@ -598,7 +904,7 @@ final class PluginLibraryViewModel: ObservableObject {
     }
 
     func selectedPlugin(in plugins: [PluginRecord]) -> PluginRecord? {
-        guard let selectedPluginID else { return nil }
+        guard let selectedPluginID = selectedPluginIDs.first else { return nil }
         return plugins.first(where: { $0.id == selectedPluginID })
     }
 
@@ -612,7 +918,33 @@ final class PluginLibraryViewModel: ObservableObject {
             plugins.filter { $0.displayVendor == vendor }.count
         case .folder(let folder):
             plugins.filter { $0.rootFolderName == folder }.count
+        case .compatibility(let verdict):
+            plugins.filter { $0.compatibility.verdict == verdict }.count
         }
+    }
+
+    func toggleSelection(for pluginID: PluginRecord.ID) {
+        if selectedPluginIDs.contains(pluginID) {
+            selectedPluginIDs.remove(pluginID)
+        } else {
+            selectedPluginIDs.insert(pluginID)
+        }
+    }
+
+    func selectOnly(_ pluginID: PluginRecord.ID) {
+        selectedPluginIDs = [pluginID]
+    }
+
+    func replaceSelection(with pluginIDs: Set<PluginRecord.ID>) {
+        selectedPluginIDs = pluginIDs
+    }
+
+    func clearSelection() {
+        selectedPluginIDs.removeAll()
+    }
+
+    var scanScopeDescription: String {
+        rootURLs.map { $0.path }.joined(separator: "\n")
     }
 }
 

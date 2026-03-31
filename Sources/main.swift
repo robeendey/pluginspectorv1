@@ -38,10 +38,10 @@ struct PluginSpectorApp: App {
 
                 Divider()
 
-                Text("Current root")
+                Text("Active scan locations")
                     .font(.headline)
 
-                Text(PluginLibraryViewModel.defaultRoot.path)
+                Text(PluginLibraryViewModel.defaultRoots.map(\.path).joined(separator: "\n"))
                     .textSelection(.enabled)
             }
             .padding(24)

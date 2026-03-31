@@ -1,6 +1,6 @@
 # PluginSpector Beta Audit App
 
-Small native macOS SwiftUI app that scans `/Library/Audio/Plug-Ins` and gives you a trust-first audit browser for installed plugin bundles.
+Small native macOS SwiftUI app that scans standard macOS audio plugin locations, including Pro Tools AAX folders, and gives you a trust-first audit browser for installed plugin bundles.
 
 ## Run
 
@@ -34,7 +34,7 @@ That creates shareable artifacts in `dist/`.
 
 ## Notes
 
-- The app scans recursively inside `/Library/Audio/Plug-Ins`.
+- The app scans recursively inside `/Library/Audio/Plug-Ins` and `/Library/Application Support/Avid/Audio/Plug-Ins`.
 - The app restores the last saved library snapshot on launch so the window can load immediately, then refreshes plugin data in the background.
 - The beta is intentionally an audit-first browser, not a mover, cleanup tool, or recovery workflow.
 - Destructive actions, uninstall flows, backup flows, and hardware/license-dependent recovery features are out of scope for this beta.

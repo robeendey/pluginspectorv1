@@ -13,7 +13,7 @@ struct ContentView: View {
     @State private var sortOption = PluginSortOption.nameAscending
     @State private var sidebarWidth: CGFloat = 250
     @State private var detailPlugin: PluginRecord?
-    @State private var expandedGroups: Set<SidebarGroup> = [.manufacturer, .format, .folder]
+    @State private var expandedGroups: Set<SidebarGroup> = [.compatibility, .manufacturer, .format, .folder]
     @State private var dragStartWidth: CGFloat?
     @State private var toast: ToastMessage?
     @StateObject private var dashboard = DashboardSnapshotModel()
@@ -71,9 +71,11 @@ struct ContentView: View {
                     expandedGroups: expandedGroups,
                     manufacturerCounts: dashboard.snapshot.manufacturerCounts,
                     folderCounts: dashboard.snapshot.folderCounts,
+                    compatibilityCounts: dashboard.snapshot.compatibilityCounts,
                     filteredFormatCounts: dashboard.snapshot.filteredFormatCounts,
                     filteredManufacturerCounts: dashboard.snapshot.filteredManufacturerCounts,
                     filteredFolderCounts: dashboard.snapshot.filteredFolderCounts,
+                    filteredCompatibilityCounts: dashboard.snapshot.filteredCompatibilityCounts,
                     hasSidebarMatches: dashboard.snapshot.hasSidebarMatches,
                     totalCount: dashboard.snapshot.totalCount,
                     visibleCount: dashboard.snapshot.visibleCount,
@@ -118,9 +120,18 @@ struct ContentView: View {
                     visibleVendorCount: dashboard.snapshot.visibleVendorCount,
                     isRefreshingInBackground: library.isRefreshingInBackground,
                     selectedPlugin: dashboard.snapshot.selectedPlugin,
-                    selectedPluginID: $library.selectedPluginID,
-                    onSelectPlugin: { plugin in
-                        library.selectedPluginID = plugin.id
+                    selectedPluginIDs: library.selectedPluginIDs,
+                    onSelectOnly: { plugin in
+                        library.selectOnly(plugin.id)
+                    },
+                    onToggleSelection: { plugin in
+                        library.toggleSelection(for: plugin.id)
+                    },
+                    onSelectAllFiltered: {
+                        library.replaceSelection(with: Set(dashboard.snapshot.filteredPlugins.map(\.id)))
+                    },
+                    onClearSelection: {
+                        library.clearSelection()
                     },
                     onExport: exportReport,
                     onRevealSelected: revealSelectedPlugin,
@@ -142,14 +153,14 @@ struct ContentView: View {
             .padding(14)
 
             if library.isForegroundScanning {
-                ScanningOverlay(theme: theme, rootPath: library.rootURL.path)
+                ScanningOverlay(theme: theme, rootPath: library.scanScopeDescription)
             }
 
             if let detailPlugin {
                 DetailOverlay(
                     theme: theme,
                     plugin: detailPlugin,
-                    rootURL: library.rootURL,
+                    scanScopeDescription: library.scanScopeDescription,
                     onClose: {
                         withAnimation(.easeInOut(duration: 0.18)) {
                             self.detailPlugin = nil
@@ -188,8 +199,8 @@ struct ContentView: View {
         .onChange(of: library.selectedFilter) { _ in
             rebuildSnapshot()
         }
-        .onChange(of: library.selectedPluginID) { _ in
-            rebuildSnapshot()
+        .onChange(of: library.selectedPluginIDs) { _ in
+            dashboard.updateSelection(selectedPluginIDs: library.selectedPluginIDs)
         }
         .onChange(of: sidebarSearchText) { _ in
             scheduleSidebarSearchRebuild()
@@ -202,7 +213,7 @@ struct ContentView: View {
         }
         .animation(.easeInOut(duration: 0.18), value: themeKey)
         .animation(.easeInOut(duration: 0.15), value: library.selectedFilter)
-        .animation(.easeInOut(duration: 0.15), value: library.selectedPluginID)
+        .animation(.easeInOut(duration: 0.15), value: library.selectedPluginIDs)
     }
 
     private func rebuildSnapshot() {
@@ -212,7 +223,7 @@ struct ContentView: View {
             searchText: debouncedSearchText,
             sidebarSearchText: debouncedSidebarSearchText,
             sortOption: sortOption,
-            selectedPluginID: library.selectedPluginID
+            selectedPluginIDs: library.selectedPluginIDs
         )
     }
 
@@ -272,7 +283,9 @@ struct ContentView: View {
             .appendingPathComponent("Downloads", isDirectory: true)
             .appendingPathComponent(filename)
 
-        let plugins = dashboard.snapshot.filteredPlugins
+        let plugins = library.selectedPluginIDs.isEmpty
+            ? dashboard.snapshot.filteredPlugins
+            : dashboard.snapshot.filteredPlugins.filter { library.selectedPluginIDs.contains($0.id) }
 
         Task.detached(priority: .userInitiated) {
             let rows = plugins.map { plugin in
@@ -299,7 +312,8 @@ struct ContentView: View {
                 try csv.write(to: destination, atomically: true, encoding: .utf8)
                 await MainActor.run {
                     NSWorkspace.shared.activateFileViewerSelecting([destination])
-                    showToast("Exported report to Downloads.", color: theme.accent)
+                    let targetLabel = library.selectedPluginIDs.isEmpty ? "report" : "selected plugins report"
+                    showToast("Exported \(targetLabel) to Downloads.", color: theme.accent)
                 }
             } catch {
                 await MainActor.run {
@@ -315,7 +329,7 @@ struct ContentView: View {
 
     private func revealSelectedPlugin() {
         guard let selectedPlugin = dashboard.snapshot.selectedPlugin else {
-            showToast("Select a plugin first.", color: ThemeTone.orange.textColor(in: theme))
+            showToast("Select one or more plugins first.", color: ThemeTone.orange.textColor(in: theme))
             return
         }
 
@@ -329,7 +343,7 @@ struct ContentView: View {
 
     private func openSelectedPlugin() {
         guard let selectedPlugin = dashboard.snapshot.selectedPlugin else {
-            showToast("Select a plugin first.", color: ThemeTone.orange.textColor(in: theme))
+            showToast("Select one or more plugins first.", color: ThemeTone.orange.textColor(in: theme))
             return
         }
 
@@ -339,7 +353,7 @@ struct ContentView: View {
 
     private func openDetailForSelectedPlugin() {
         guard let selectedPlugin = dashboard.snapshot.selectedPlugin else {
-            showToast("Select a plugin first.", color: ThemeTone.orange.textColor(in: theme))
+            showToast("Select one or more plugins first.", color: ThemeTone.orange.textColor(in: theme))
             return
         }
 
@@ -350,12 +364,15 @@ struct ContentView: View {
 }
 
 private enum SidebarGroup: Hashable {
+    case compatibility
     case manufacturer
     case format
     case folder
 
     var title: String {
         switch self {
+        case .compatibility:
+            "Compatibility"
         case .manufacturer:
             "Manufacturer"
         case .format:
@@ -367,6 +384,8 @@ private enum SidebarGroup: Hashable {
 
     var icon: String {
         switch self {
+        case .compatibility:
+            "exclamationmark.shield"
         case .manufacturer:
             "building.2.crop.circle"
         case .format:
@@ -388,9 +407,11 @@ private struct SidebarPanel: View {
     let expandedGroups: Set<SidebarGroup>
     let manufacturerCounts: [(String, Int)]
     let folderCounts: [(String, Int)]
+    let compatibilityCounts: [(PluginCompatibility.Verdict, Int)]
     let filteredFormatCounts: [(PluginFormat, Int)]
     let filteredManufacturerCounts: [(String, Int)]
     let filteredFolderCounts: [(String, Int)]
+    let filteredCompatibilityCounts: [(PluginCompatibility.Verdict, Int)]
     let hasSidebarMatches: Bool
     let totalCount: Int
     let visibleCount: Int
@@ -437,6 +458,29 @@ private struct SidebarPanel: View {
                             )
 
                             if sidebarSearchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || hasSidebarMatches {
+                                SidebarGroupView(
+                                    theme: theme,
+                                    group: .compatibility,
+                                    isExpanded: expandedGroups.contains(.compatibility),
+                                    onToggle: { onToggleGroup(.compatibility) }
+                                ) {
+                                    VStack(spacing: 6) {
+                                        ForEach(filteredCompatibilityCounts, id: \.0.rawValue) { verdict, count in
+                                            SidebarFilterButton(
+                                                theme: theme,
+                                                title: verdict.title,
+                                                subtitle: verdict.subtitle,
+                                                count: count,
+                                                icon: compatibilityIcon(for: verdict),
+                                                isSelected: selectedFilter == .compatibility(verdict),
+                                                compact: true
+                                            ) {
+                                                onSelectFilter(.compatibility(verdict))
+                                            }
+                                        }
+                                    }
+                                }
+
                                 SidebarGroupView(
                                     theme: theme,
                                     group: .manufacturer,
@@ -618,6 +662,7 @@ private struct SidebarPanel: View {
             summaryRow(title: "Visible", value: "\(visibleCount)", accent: theme.accent)
             summaryRow(title: "Manufacturers", value: "\(manufacturerCounts.count)", accent: ThemeTone.teal.textColor(in: theme))
             summaryRow(title: "Folders", value: "\(folderCounts.count)", accent: ThemeTone.orange.textColor(in: theme))
+            summaryRow(title: "Needs review", value: compatibilitySummaryCount, accent: ThemeTone.red.textColor(in: theme))
             summaryRow(title: "Disk usage", value: totalPackageSizeDescription, accent: ThemeTone.green.textColor(in: theme))
             summaryRow(title: "Selected", value: "\(selectedCount)", accent: ThemeTone.purple.textColor(in: theme))
         }
@@ -640,6 +685,26 @@ private struct SidebarPanel: View {
             Text(value)
                 .font(.system(size: 12, weight: .medium, design: .monospaced))
                 .foregroundStyle(accent)
+        }
+    }
+
+    private var compatibilitySummaryCount: String {
+        let flagged = compatibilityCounts
+            .filter { $0.0 == .legacy32Bit || $0.0 == .rosetta || $0.0 == .unknown }
+            .reduce(0) { $0 + $1.1 }
+        return "\(flagged)"
+    }
+
+    private func compatibilityIcon(for verdict: PluginCompatibility.Verdict) -> String {
+        switch verdict {
+        case .native:
+            "checkmark.circle"
+        case .rosetta:
+            "exclamationmark.triangle"
+        case .legacy32Bit:
+            "xmark.octagon"
+        case .unknown:
+            "questionmark.circle"
         }
     }
 }
@@ -798,8 +863,11 @@ private struct MainPanel: View {
     let visibleVendorCount: Int
     let isRefreshingInBackground: Bool
     let selectedPlugin: PluginRecord?
-    @Binding var selectedPluginID: PluginRecord.ID?
-    let onSelectPlugin: (PluginRecord) -> Void
+    let selectedPluginIDs: Set<PluginRecord.ID>
+    let onSelectOnly: (PluginRecord) -> Void
+    let onToggleSelection: (PluginRecord) -> Void
+    let onSelectAllFiltered: () -> Void
+    let onClearSelection: () -> Void
     let onExport: () -> Void
     let onRevealSelected: () -> Void
     let onOpenSelected: () -> Void
@@ -833,7 +901,9 @@ private struct MainPanel: View {
             Spacer()
 
             HStack(spacing: 8) {
-                ChromeButton(theme: theme, title: "Export report", tone: .neutral, action: onExport)
+                ChromeButton(theme: theme, title: selectedPluginIDs.isEmpty ? "Export report" : "Export selected", tone: .neutral, action: onExport)
+                ChromeButton(theme: theme, title: "Select filtered", tone: .neutral, isDisabled: plugins.isEmpty, action: onSelectAllFiltered)
+                ChromeButton(theme: theme, title: "Clear selection", tone: .neutral, isDisabled: selectedPluginIDs.isEmpty, action: onClearSelection)
                 ChromeButton(theme: theme, title: "Rescan", tone: .neutral, action: onRescan)
                 ChromeButton(theme: theme, title: "Reveal selected", tone: .accent, isDisabled: selectedPlugin == nil, action: onRevealSelected)
             }
@@ -880,16 +950,19 @@ private struct MainPanel: View {
                             theme: theme,
                             plugin: plugin,
                             isMultiFormat: multiFormatPluginIDs.contains(plugin.id),
-                            isSelected: selectedPluginID == plugin.id,
+                            isSelected: selectedPluginIDs.contains(plugin.id),
                             onSelect: {
-                                onSelectPlugin(plugin)
+                                onSelectOnly(plugin)
+                            },
+                            onToggleSelection: {
+                                onToggleSelection(plugin)
                             },
                             onDetails: {
-                                onSelectPlugin(plugin)
+                                onSelectOnly(plugin)
                                 onOpenPluginDetails(plugin)
                             },
                             onReveal: {
-                                onSelectPlugin(plugin)
+                                onSelectOnly(plugin)
                                 onRevealPlugin(plugin)
                             }
                         )
@@ -908,7 +981,7 @@ private struct MainPanel: View {
 
             Spacer()
 
-            Text("\(selectedPlugin == nil ? 0 : 1) of \(plugins.count) selected")
+            Text("\(selectedPluginIDs.count) of \(plugins.count) selected")
                 .font(.system(size: 11, weight: .medium, design: .monospaced))
                 .foregroundStyle(theme.textDim)
         }
@@ -1124,6 +1197,7 @@ private struct PluginCard: View {
     let isMultiFormat: Bool
     let isSelected: Bool
     let onSelect: () -> Void
+    let onToggleSelection: () -> Void
     let onDetails: () -> Void
     let onReveal: () -> Void
 
@@ -1144,6 +1218,13 @@ private struct PluginCard: View {
 
     var body: some View {
         HStack(spacing: 11) {
+            Button(action: onToggleSelection) {
+                Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(isSelected ? theme.accent : theme.textDim)
+            }
+            .buttonStyle(.plain)
+
             RoundedRectangle(cornerRadius: 3, style: .continuous)
                 .fill(tone.textColor(in: theme))
                 .frame(width: 3)
@@ -1175,7 +1256,7 @@ private struct PluginCard: View {
 
             VStack(alignment: .trailing, spacing: 8) {
                 HStack(spacing: 4) {
-                    SmallTag(theme: theme, title: plugin.compatibility.summary, tone: compatibilityTone)
+                    SmallTag(theme: theme, title: plugin.compatibility.verdict.title, tone: compatibilityTone)
                     if isMultiFormat {
                         SmallTag(theme: theme, title: "Multi-Format", tone: .purple)
                     }
@@ -1384,7 +1465,7 @@ private struct ScanningOverlay: View {
                     Text(rootPath)
                         .font(.system(size: 11, weight: .medium, design: .monospaced))
                         .foregroundStyle(theme.textDim)
-                        .lineLimit(1)
+                        .multilineTextAlignment(.center)
                 }
 
                 ProgressView()
@@ -1409,7 +1490,7 @@ private struct ScanningOverlay: View {
 private struct DetailOverlay: View {
     let theme: PrototypeTheme
     let plugin: PluginRecord
-    let rootURL: URL
+    let scanScopeDescription: String
     let onClose: () -> Void
 
     var body: some View {
@@ -1429,7 +1510,7 @@ private struct DetailOverlay: View {
                             .font(.system(size: 11, weight: .medium, design: .monospaced))
                             .foregroundStyle(theme.textDim)
 
-                        SmallTag(theme: theme, title: plugin.compatibility.summary, tone: compatibilityTone)
+                        SmallTag(theme: theme, title: plugin.compatibility.verdict.title, tone: compatibilityTone)
                     }
 
                     Spacer()
@@ -1454,13 +1535,15 @@ private struct DetailOverlay: View {
                     detailRow("Bundle ID", plugin.bundleIdentifier ?? "Not reported")
                     detailRow("Executable", plugin.executableName ?? "Not reported")
                     detailRow("Minimum macOS", plugin.minimumSystemVersion ?? "Not reported")
-                    detailRow("Compatibility", plugin.compatibility.summary)
+                    detailRow("Compatibility", plugin.compatibility.verdict.title)
+                    detailRow("Review guidance", compatibilityGuidance, multiline: true)
                     detailRow("Compatibility reason", plugin.compatibility.reason, multiline: true)
                     detailRow("Folder", plugin.rootFolderName)
+                    detailRow("Scan location", plugin.scanRootLabel)
                     detailRow("Extension", plugin.packageExtension)
                     detailRow("Modified", plugin.modifiedAt?.formatted(date: .abbreviated, time: .shortened) ?? "Unknown")
                     detailRow("Audio Components", plugin.componentSummary)
-                    detailRow("Scan Root", rootURL.path, multiline: true)
+                    detailRow("Active scan scope", scanScopeDescription, multiline: true)
                     detailRow("Path", plugin.path, multiline: true, isLast: true)
                 }
 
@@ -1521,6 +1604,19 @@ private struct DetailOverlay: View {
             .red
         case .unknown:
             .gray
+        }
+    }
+
+    private var compatibilityGuidance: String {
+        switch plugin.compatibility.verdict {
+        case .native:
+            return "This plugin should work on this Mac without Rosetta."
+        case .rosetta:
+            return "This plugin may still work, but only through Rosetta. Treat it as cautionary, not dead."
+        case .legacy32Bit:
+            return "This plugin will never work on this machine because current macOS cannot run legacy 32-bit binaries."
+        case .unknown:
+            return "The app cannot classify this plugin confidently yet. Review it manually before cleanup."
         }
     }
 }
