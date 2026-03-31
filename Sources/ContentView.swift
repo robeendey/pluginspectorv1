@@ -7,7 +7,9 @@ struct ContentView: View {
     @AppStorage("pluginspector.sidebarWidth") private var storedSidebarWidth = 250.0
 
     @State private var searchText = ""
+    @State private var debouncedSearchText = ""
     @State private var sidebarSearchText = ""
+    @State private var debouncedSidebarSearchText = ""
     @State private var sortOption = PluginSortOption.nameAscending
     @State private var sidebarWidth: CGFloat = 250
     @State private var detailPlugin: PluginRecord?
@@ -35,11 +37,20 @@ struct ContentView: View {
         if let lastScannedAt = library.lastScannedAt {
             scanText = "Last scanned: \(lastScannedAt.formatted(date: .abbreviated, time: .shortened))"
         } else {
-            scanText = "Ready to scan your installed plugins"
+            scanText = library.isRefreshingInBackground ? "Loading cached library while the background scan runs" : "Ready to scan your installed plugins"
         }
 
         let visibleCount = dashboard.snapshot.visibleCount
-        return "\(scanText) · \(visibleCount) plugin\(visibleCount == 1 ? "" : "s")"
+        let statusSuffix: String
+        if library.isRefreshingInBackground {
+            statusSuffix = " · Refreshing in background"
+        } else if library.isForegroundScanning {
+            statusSuffix = " · Scanning now"
+        } else {
+            statusSuffix = ""
+        }
+
+        return "\(scanText) · \(visibleCount) plugin\(visibleCount == 1 ? "" : "s")\(statusSuffix)"
     }
 
     var body: some View {
@@ -72,11 +83,8 @@ struct ContentView: View {
                     onSelectFilter: { filter in
                         library.selectedFilter = filter
                     },
-                    onOpenNotifications: {
-                        showToast("Notification settings UI is next on the list.", color: ThemeTone.teal.textColor(in: theme))
-                    },
                     onScan: {
-                        library.scan()
+                        library.scan(presentation: .foreground)
                     }
                 )
                 .frame(width: sidebarWidth)
@@ -108,6 +116,7 @@ struct ContentView: View {
                     multiFormatPluginIDs: dashboard.snapshot.multiFormatPluginIDs,
                     visibleFormatCount: dashboard.snapshot.visibleFormatCount,
                     visibleVendorCount: dashboard.snapshot.visibleVendorCount,
+                    isRefreshingInBackground: library.isRefreshingInBackground,
                     selectedPlugin: dashboard.snapshot.selectedPlugin,
                     selectedPluginID: $library.selectedPluginID,
                     onSelectPlugin: { plugin in
@@ -124,7 +133,7 @@ struct ContentView: View {
                         revealPlugin(plugin)
                     },
                     onRescan: {
-                        library.scan()
+                        library.scan(presentation: .foreground)
                     }
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -132,7 +141,7 @@ struct ContentView: View {
             .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
             .padding(14)
 
-            if library.isScanning {
+            if library.isForegroundScanning {
                 ScanningOverlay(theme: theme, rootPath: library.rootURL.path)
             }
 
@@ -162,9 +171,10 @@ struct ContentView: View {
         }
         .task {
             sidebarWidth = clampedSidebarWidth(CGFloat(storedSidebarWidth))
+            debouncedSearchText = searchText
+            debouncedSidebarSearchText = sidebarSearchText
             rebuildSnapshot()
-            guard library.plugins.isEmpty else { return }
-            library.scan()
+            library.startInitialRefreshIfNeeded()
         }
         .onAppear {
             sidebarWidth = clampedSidebarWidth(CGFloat(storedSidebarWidth))
@@ -182,13 +192,13 @@ struct ContentView: View {
             rebuildSnapshot()
         }
         .onChange(of: sidebarSearchText) { _ in
-            rebuildSnapshot()
+            scheduleSidebarSearchRebuild()
         }
         .onChange(of: sortOption) { _ in
             rebuildSnapshot()
         }
         .onChange(of: searchText) { _ in
-            rebuildSnapshot()
+            scheduleSearchRebuild()
         }
         .animation(.easeInOut(duration: 0.18), value: themeKey)
         .animation(.easeInOut(duration: 0.15), value: library.selectedFilter)
@@ -199,11 +209,31 @@ struct ContentView: View {
         dashboard.rebuild(
             plugins: library.plugins,
             selectedFilter: library.selectedFilter,
-            searchText: searchText,
-            sidebarSearchText: sidebarSearchText,
+            searchText: debouncedSearchText,
+            sidebarSearchText: debouncedSidebarSearchText,
             sortOption: sortOption,
             selectedPluginID: library.selectedPluginID
         )
+    }
+
+    private func scheduleSearchRebuild() {
+        let pendingValue = searchText
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            guard pendingValue == searchText else { return }
+            debouncedSearchText = pendingValue
+            rebuildSnapshot()
+        }
+    }
+
+    private func scheduleSidebarSearchRebuild() {
+        let pendingValue = sidebarSearchText
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 200_000_000)
+            guard pendingValue == sidebarSearchText else { return }
+            debouncedSidebarSearchText = pendingValue
+            rebuildSnapshot()
+        }
     }
 
     private func clampedSidebarWidth(_ proposed: CGFloat) -> CGFloat {
@@ -368,14 +398,13 @@ private struct SidebarPanel: View {
     let totalPackageSizeDescription: String
     let onToggleGroup: (SidebarGroup) -> Void
     let onSelectFilter: (SidebarFilter) -> Void
-    let onOpenNotifications: () -> Void
     let onScan: () -> Void
 
     private var babyFilteredManufacturers: [(String, Int)] {
         let trimmed = manufacturerFilter.trimmingCharacters(in: .whitespaces)
         guard !trimmed.isEmpty else { return filteredManufacturerCounts }
         return filteredManufacturerCounts.filter {
-            $0.0.localizedCaseInsensitiveContains(trimmed)
+            $0.0.normalizedSearchKey.contains(trimmed.normalizedSearchKey)
         }
     }
 
@@ -498,19 +527,6 @@ private struct SidebarPanel: View {
                     SidebarSection(theme: theme, title: "Summary") {
                         summaryCard
                     }
-
-                    Button(action: onOpenNotifications) {
-                        HStack(spacing: 10) {
-                            Image(systemName: "bell")
-                            Text("Notification Settings")
-                            Spacer()
-                        }
-                        .font(.system(size: 12, weight: .medium, design: .rounded))
-                        .foregroundStyle(theme.textDim)
-                        .padding(.vertical, 8)
-                        .padding(.horizontal, 2)
-                    }
-                    .buttonStyle(.plain)
                 }
                 .padding(.horizontal, 12)
                 .padding(.vertical, 14)
@@ -780,6 +796,7 @@ private struct MainPanel: View {
     let multiFormatPluginIDs: Set<PluginRecord.ID>
     let visibleFormatCount: Int
     let visibleVendorCount: Int
+    let isRefreshingInBackground: Bool
     let selectedPlugin: PluginRecord?
     @Binding var selectedPluginID: PluginRecord.ID?
     let onSelectPlugin: (PluginRecord) -> Void
@@ -855,7 +872,7 @@ private struct MainPanel: View {
         ScrollView {
             LazyVStack(spacing: 8) {
                 if plugins.isEmpty {
-                    EmptyState(theme: theme, searchText: searchText)
+                    EmptyState(theme: theme, searchText: searchText, isRefreshingInBackground: isRefreshingInBackground)
                         .padding(.top, 80)
                 } else {
                     ForEach(plugins) { plugin in
@@ -1158,6 +1175,7 @@ private struct PluginCard: View {
 
             VStack(alignment: .trailing, spacing: 8) {
                 HStack(spacing: 4) {
+                    SmallTag(theme: theme, title: plugin.compatibility.summary, tone: compatibilityTone)
                     if isMultiFormat {
                         SmallTag(theme: theme, title: "Multi-Format", tone: .purple)
                     }
@@ -1194,6 +1212,19 @@ private struct PluginCard: View {
     private var expandedLine: String {
         let bundleID = plugin.bundleIdentifier ?? "Bundle ID not reported"
         return "\(bundleID) · \(plugin.displaySize) · \(plugin.path)"
+    }
+
+    private var compatibilityTone: ThemeTone {
+        switch plugin.compatibility.verdict {
+        case .native:
+            .green
+        case .rosetta:
+            .orange
+        case .legacy32Bit:
+            .red
+        case .unknown:
+            .gray
+        }
     }
 }
 
@@ -1300,6 +1331,7 @@ private enum ChromeButtonTone {
 private struct EmptyState: View {
     let theme: PrototypeTheme
     let searchText: String
+    let isRefreshingInBackground: Bool
 
     var body: some View {
         VStack(spacing: 14) {
@@ -1307,15 +1339,30 @@ private struct EmptyState: View {
                 .font(.system(size: 30, weight: .medium))
                 .foregroundStyle(theme.textDim)
 
-            Text(searchText.isEmpty ? "No Plugins Found" : "No Matching Plugins")
+            Text(title)
                 .font(.system(size: 18, weight: .semibold, design: .rounded))
                 .foregroundStyle(theme.text)
 
-            Text(searchText.isEmpty ? "Run a scan or check the scan root in the sidebar." : "Try a different search term or clear the current filter.")
+            Text(message)
                 .font(.system(size: 12, weight: .medium, design: .monospaced))
                 .foregroundStyle(theme.textDim)
+                .multilineTextAlignment(.center)
         }
         .frame(maxWidth: .infinity)
+    }
+
+    private var title: String {
+        if isRefreshingInBackground && searchText.isEmpty {
+            return "Loading Plugin Library"
+        }
+        return searchText.isEmpty ? "No Plugins Found" : "No Matching Plugins"
+    }
+
+    private var message: String {
+        if isRefreshingInBackground && searchText.isEmpty {
+            return "The app opened immediately from startup state and is scanning your plugin folders in the background."
+        }
+        return searchText.isEmpty ? "Run a scan or check the scan root in the sidebar." : "Try a different search term or clear the current filter."
     }
 }
 
@@ -1381,6 +1428,8 @@ private struct DetailOverlay: View {
                         Text("\(plugin.format.rawValue) · \(plugin.displayVendor)")
                             .font(.system(size: 11, weight: .medium, design: .monospaced))
                             .foregroundStyle(theme.textDim)
+
+                        SmallTag(theme: theme, title: plugin.compatibility.summary, tone: compatibilityTone)
                     }
 
                     Spacer()
@@ -1405,6 +1454,8 @@ private struct DetailOverlay: View {
                     detailRow("Bundle ID", plugin.bundleIdentifier ?? "Not reported")
                     detailRow("Executable", plugin.executableName ?? "Not reported")
                     detailRow("Minimum macOS", plugin.minimumSystemVersion ?? "Not reported")
+                    detailRow("Compatibility", plugin.compatibility.summary)
+                    detailRow("Compatibility reason", plugin.compatibility.reason, multiline: true)
                     detailRow("Folder", plugin.rootFolderName)
                     detailRow("Extension", plugin.packageExtension)
                     detailRow("Modified", plugin.modifiedAt?.formatted(date: .abbreviated, time: .shortened) ?? "Unknown")
@@ -1457,6 +1508,19 @@ private struct DetailOverlay: View {
                     .fill(theme.border)
                     .frame(height: 1)
             }
+        }
+    }
+
+    private var compatibilityTone: ThemeTone {
+        switch plugin.compatibility.verdict {
+        case .native:
+            .green
+        case .rosetta:
+            .orange
+        case .legacy32Bit:
+            .red
+        case .unknown:
+            .gray
         }
     }
 }

@@ -1,6 +1,6 @@
-# PluginSpector Prototype
+# PluginSpector Beta Audit App
 
-Small native macOS SwiftUI prototype that scans `/Library/Audio/Plug-Ins` and gives you a searchable browser for installed plugin bundles.
+Small native macOS SwiftUI app that scans `/Library/Audio/Plug-Ins` and gives you a trust-first audit browser for installed plugin bundles.
 
 ## Run
 
@@ -16,20 +16,25 @@ swift run
 
 That creates shareable artifacts in `dist/`.
 
-## What It Shows
+## Beta Scope
 
 - Plugin name
 - Format (`AU`, `VST2`, `VST3`, `AAX` when present)
-- Vendor guess
+- Normalized manufacturer name
 - Version
 - Package size
 - Folder/location
 - Modified date
+- Basic compatibility / legacy verdict
 - Bundle details in the inspector pane
 - Sidebar section search and list sorting
+- Reveal in Finder
+- CSV export report
+- Cached startup state with background refresh
 
 ## Notes
 
 - The app scans recursively inside `/Library/Audio/Plug-Ins`.
-- It is intentionally a browser prototype, not a mover/cleanup tool yet.
-- If you want the next step, we can add favorites, hide/archive rules, duplicate detection, or safe move-to-quarantine flows.
+- The app restores the last saved library snapshot on launch so the window can load immediately, then refreshes plugin data in the background.
+- The beta is intentionally an audit-first browser, not a mover, cleanup tool, or recovery workflow.
+- Destructive actions, uninstall flows, backup flows, and hardware/license-dependent recovery features are out of scope for this beta.

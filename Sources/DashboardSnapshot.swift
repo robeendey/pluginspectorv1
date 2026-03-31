@@ -67,7 +67,7 @@ final class DashboardSnapshotModel: ObservableObject {
         if trimmedSearch.isEmpty {
             matchingPlugins = scopedPlugins
         } else {
-            let normalizedSearch = trimmedSearch.lowercased()
+            let normalizedSearch = trimmedSearch.normalizedSearchKey
             matchingPlugins = scopedPlugins.filter { plugin in
                 plugin.searchIndex.contains(normalizedSearch)
             }
@@ -89,7 +89,7 @@ final class DashboardSnapshotModel: ObservableObject {
         let selectedCount = selectedPlugin == nil ? 0 : 1
 
         let aggregates = buildAggregates(for: plugins)
-        let sidebarQuery = sidebarSearchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let sidebarQuery = sidebarSearchText.trimmingCharacters(in: .whitespacesAndNewlines).normalizedSearchKey
         let filteredManufacturerCounts = filterSidebarCounts(aggregates.manufacturerCounts, query: sidebarQuery)
         let filteredFormatCounts = filterSidebarCounts(aggregates.formatCounts, query: sidebarQuery)
         let filteredFolderCounts = filterSidebarCounts(aggregates.folderCounts, query: sidebarQuery)
@@ -183,7 +183,7 @@ final class DashboardSnapshotModel: ObservableObject {
         guard !query.isEmpty else { return counts }
 
         return counts.filter { item, _ in
-            sidebarTitle(for: item).lowercased().contains(query)
+            sidebarTitle(for: item).normalizedSearchKey.contains(query)
         }
     }
 
