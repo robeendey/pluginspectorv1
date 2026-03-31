@@ -515,6 +515,7 @@ private struct SidebarPanel: View {
                 .padding(.horizontal, 12)
                 .padding(.vertical, 14)
             }
+            .background(OverlayScrollViewChrome().allowsHitTesting(false))
 
             Button(action: onScan) {
                 HStack(spacing: 8) {
@@ -882,6 +883,7 @@ private struct MainPanel: View {
             .padding(.horizontal, 18)
             .padding(.vertical, 12)
         }
+        .background(OverlayScrollViewChrome().allowsHitTesting(false))
     }
 
     private var bottombar: some View {
@@ -902,6 +904,34 @@ private struct MainPanel: View {
             Rectangle()
                 .fill(theme.border)
                 .frame(height: 1)
+        }
+    }
+}
+
+private struct OverlayScrollViewChrome: NSViewRepresentable {
+    func makeNSView(context: Context) -> ChromeView {
+        ChromeView()
+    }
+
+    func updateNSView(_ nsView: ChromeView, context: Context) {
+        nsView.apply()
+    }
+
+    final class ChromeView: NSView {
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            apply()
+        }
+
+        override func viewDidMoveToSuperview() {
+            super.viewDidMoveToSuperview()
+            apply()
+        }
+
+        func apply() {
+            guard let scrollView = enclosingScrollView else { return }
+            scrollView.scrollerStyle = .overlay
+            scrollView.autohidesScrollers = true
         }
     }
 }
