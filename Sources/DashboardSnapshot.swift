@@ -16,6 +16,7 @@ struct DashboardSnapshot {
     let selectedCount: Int
     let visibleFormatCount: Int
     let visibleVendorCount: Int
+    let multiFormatPluginIDs: Set<PluginRecord.ID>
 
     static let empty = DashboardSnapshot(
         filteredPlugins: [],
@@ -32,7 +33,8 @@ struct DashboardSnapshot {
         selectedPlugin: nil,
         selectedCount: 0,
         visibleFormatCount: 0,
-        visibleVendorCount: 0
+        visibleVendorCount: 0,
+        multiFormatPluginIDs: []
     )
 }
 
@@ -93,6 +95,12 @@ final class DashboardSnapshotModel: ObservableObject {
         let filteredFolderCounts = filterSidebarCounts(aggregates.folderCounts, query: sidebarQuery)
         let hasSidebarMatches = !filteredManufacturerCounts.isEmpty || !filteredFormatCounts.isEmpty || !filteredFolderCounts.isEmpty
 
+        let multiFormatPluginIDs: Set<PluginRecord.ID> = Set(
+            PluginGrouping.collapse(filteredPlugins)
+                .filter(\.isMultiFormat)
+                .flatMap { $0.variants.map(\.id) }
+        )
+
         snapshot = DashboardSnapshot(
             filteredPlugins: filteredPlugins,
             filteredManufacturerCounts: filteredManufacturerCounts,
@@ -108,7 +116,8 @@ final class DashboardSnapshotModel: ObservableObject {
             selectedPlugin: selectedPlugin,
             selectedCount: selectedCount,
             visibleFormatCount: visibleFormats.count,
-            visibleVendorCount: visibleVendors.count
+            visibleVendorCount: visibleVendors.count,
+            multiFormatPluginIDs: multiFormatPluginIDs
         )
     }
 

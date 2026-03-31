@@ -184,7 +184,8 @@ enum PluginLibraryScanner {
         let componentNames = componentNames(from: infoDictionary)
         let rootFolder = rootFolderName(for: url, root: root)
         let relativePath = relativeLocation(for: url, root: root)
-        let vendor = inferVendor(for: url, bundleIdentifier: bundleIdentifier, info: infoDictionary)
+        let rawVendor = inferVendor(for: url, bundleIdentifier: bundleIdentifier, info: infoDictionary)
+        let vendor = rawVendor.map { PluginLibraryScanner.sanitizedManufacturer($0) }
         let displayVendor = vendor ?? "Unknown vendor"
         let displayVersion = version ?? "Unknown"
         let componentSummary = componentNames.isEmpty ? "None reported" : componentNames.joined(separator: ", ")
@@ -244,6 +245,40 @@ enum PluginLibraryScanner {
         return components.compactMap { component in
             (component["name"] as? String) ?? (component["description"] as? String)
         }
+    }
+
+    // MARK: - Manufacturer sanitization
+
+    /// Strips copyright noise, normalises 4-digit years, and maps known brand
+    /// aliases to a single canonical name.
+    static func sanitizedManufacturer(_ raw: String) -> String {
+        var s = raw
+
+        // Strip © symbol
+        s = s.replacingOccurrences(of: "©", with: "")
+        // Strip "Copyright" word (case-insensitive)
+        s = s.replacingOccurrences(of: #"(?i)\bcopyright\b"#, with: "", options: .regularExpression)
+        // Strip standalone 4-digit years, e.g. 2022 or 2018-2024
+        s = s.replacingOccurrences(
+            of: #"\b[12][0-9]{3}(?:-[12][0-9]{3})?\b"#,
+            with: "",
+            options: .regularExpression
+        )
+        s = s.trimmingCharacters(in: .whitespaces)
+
+        // Brand grouping on the cleaned value
+        let key = s.lowercased()
+        switch key {
+        case "uad", "universal audio", "uad mono",
+             _ where key.hasPrefix("uad "):
+            return "Universal Audio"
+        case "plugin-alliance", "plugin alliance":
+            return "Plugin Alliance"
+        default:
+            break
+        }
+
+        return s.isEmpty ? raw.trimmingCharacters(in: .whitespaces).capitalized : s.capitalized
     }
 
     private static func inferVendor(for url: URL, bundleIdentifier: String?, info: [String: Any]) -> String? {

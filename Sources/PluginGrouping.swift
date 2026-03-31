@@ -27,6 +27,8 @@ struct CollapsedPlugin: Identifiable, Hashable {
 
     var id: String { canonicalKey }
 
+    var isMultiFormat: Bool { formats.count > 1 }
+
     var formatSummary: String {
         formats.map(\.shortLabel).joined(separator: " / ")
     }
