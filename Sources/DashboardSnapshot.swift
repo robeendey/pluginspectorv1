@@ -141,7 +141,7 @@ final class DashboardSnapshotModel: ObservableObject {
             totalBytes += plugin.packageSizeBytes
         }
 
-        let manufacturerCounts = sortedCounts(vendorCounts)
+        let manufacturerCounts = sortedAlphabetically(vendorCounts)
         let folderCountsSorted = sortedCounts(folderCounts)
         let formatCountsSorted = PluginFormat.allCases
             .filter { $0 != .other }
@@ -167,6 +167,14 @@ final class DashboardSnapshotModel: ObservableObject {
                     return lhs.key.localizedCaseInsensitiveCompare(rhs.key) == .orderedAscending
                 }
                 return lhs.value > rhs.value
+            }
+            .map { ($0.key, $0.value) }
+    }
+
+    private func sortedAlphabetically(_ counts: [String: Int]) -> [(String, Int)] {
+        counts
+            .sorted { lhs, rhs in
+                lhs.key.localizedCaseInsensitiveCompare(rhs.key) == .orderedAscending
             }
             .map { ($0.key, $0.value) }
     }
