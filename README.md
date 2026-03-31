@@ -22,13 +22,14 @@ That creates shareable artifacts in `dist/`.
 - Format (`AU`, `VST2`, `VST3`, `AAX` when present)
 - Vendor guess
 - Version
+- Package size
 - Folder/location
 - Modified date
 - Bundle details in the inspector pane
+- Sidebar section search and list sorting
 
 ## Notes
 
 - The app scans recursively inside `/Library/Audio/Plug-Ins`.
 - It is intentionally a browser prototype, not a mover/cleanup tool yet.
 - If you want the next step, we can add favorites, hide/archive rules, duplicate detection, or safe move-to-quarantine flows.
-test

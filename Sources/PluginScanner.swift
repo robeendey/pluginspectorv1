@@ -62,7 +62,7 @@ enum SidebarFilter: Hashable {
     }
 }
 
-struct PluginRecord: Identifiable, Hashable {
+struct PluginRecord: Identifiable, Hashable, Sendable {
     let bundleURL: URL
     let name: String
     let format: PluginFormat
@@ -76,14 +76,41 @@ struct PluginRecord: Identifiable, Hashable {
     let modifiedAt: Date?
     let componentNames: [String]
     let packageExtension: String
+    let packageSizeBytes: Int64
+    let searchIndex: String
 
     var id: String { bundleURL.path }
     var path: String { bundleURL.path }
     var displayVendor: String { vendor ?? "Unknown vendor" }
     var displayVersion: String { version ?? "Unknown" }
+    var displaySize: String {
+        ByteCountFormatter.string(fromByteCount: packageSizeBytes, countStyle: .file)
+    }
     var componentSummary: String {
         guard !componentNames.isEmpty else { return "None reported" }
         return componentNames.joined(separator: ", ")
+    }
+
+    static func buildSearchIndex(
+        name: String,
+        displayVendor: String,
+        displayVersion: String,
+        rootFolderName: String,
+        relativeLocation: String,
+        bundleIdentifier: String?,
+        componentSummary: String
+    ) -> String {
+        [
+            name,
+            displayVendor,
+            displayVersion,
+            rootFolderName,
+            relativeLocation,
+            bundleIdentifier ?? "",
+            componentSummary,
+        ]
+        .joined(separator: "\n")
+        .lowercased()
     }
 }
 
@@ -105,6 +132,7 @@ enum PluginLibraryScanner {
         "vst3",
         "aaxplugin",
     ]
+    private static let packageSizeCache = PackageSizeCache()
 
     static func scan(root: URL) throws -> [PluginRecord] {
         var isDirectory: ObjCBool = false
@@ -135,40 +163,16 @@ enum PluginLibraryScanner {
             enumerator.skipDescendants()
         }
 
-        return records.sorted {
-            if $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedSame {
-                return $0.path.localizedCaseInsensitiveCompare($1.path) == .orderedAscending
-            }
-
-            return $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
-        }
+        packageSizeCache.saveIfNeeded()
+        return records
     }
 
     static func formattedPackageSize(for url: URL) -> String {
-        var totalBytes: Int64 = 0
-
-        if let enumerator = FileManager.default.enumerator(
-            at: url,
-            includingPropertiesForKeys: [
-                .isRegularFileKey,
-                .fileSizeKey,
-                .totalFileAllocatedSizeKey,
-            ],
-            options: [.skipsHiddenFiles]
-        ) {
-            for case let fileURL as URL in enumerator {
-                let values = try? fileURL.resourceValues(forKeys: [
-                    .isRegularFileKey,
-                    .fileSizeKey,
-                    .totalFileAllocatedSizeKey,
-                ])
-
-                guard values?.isRegularFile == true else { continue }
-                totalBytes += Int64(values?.totalFileAllocatedSize ?? values?.fileSize ?? 0)
-            }
-        }
-
-        return ByteCountFormatter.string(fromByteCount: totalBytes, countStyle: .file)
+        let modificationDate = try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
+        return ByteCountFormatter.string(
+            fromByteCount: packageSizeCache.byteCount(for: url, modificationDate: modificationDate),
+            countStyle: .file
+        )
     }
 
     private static func loadPluginRecord(at url: URL, root: URL) -> PluginRecord {
@@ -178,21 +182,38 @@ enum PluginLibraryScanner {
         let version = (infoDictionary["CFBundleShortVersionString"] as? String) ?? (infoDictionary["CFBundleVersion"] as? String)
         let modifiedAt = try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
         let componentNames = componentNames(from: infoDictionary)
+        let rootFolder = rootFolderName(for: url, root: root)
+        let relativePath = relativeLocation(for: url, root: root)
+        let vendor = inferVendor(for: url, bundleIdentifier: bundleIdentifier, info: infoDictionary)
+        let displayVendor = vendor ?? "Unknown vendor"
+        let displayVersion = version ?? "Unknown"
+        let componentSummary = componentNames.isEmpty ? "None reported" : componentNames.joined(separator: ", ")
+        let searchIndex = PluginRecord.buildSearchIndex(
+            name: name,
+            displayVendor: displayVendor,
+            displayVersion: displayVersion,
+            rootFolderName: rootFolder,
+            relativeLocation: relativePath,
+            bundleIdentifier: bundleIdentifier,
+            componentSummary: componentSummary
+        )
 
         return PluginRecord(
             bundleURL: url,
             name: name,
             format: PluginFormat.detect(from: url),
-            vendor: inferVendor(for: url, bundleIdentifier: bundleIdentifier, info: infoDictionary),
+            vendor: vendor,
             version: version,
             bundleIdentifier: bundleIdentifier,
             executableName: infoDictionary["CFBundleExecutable"] as? String,
             minimumSystemVersion: infoDictionary["LSMinimumSystemVersion"] as? String,
-            rootFolderName: rootFolderName(for: url, root: root),
-            relativeLocation: relativeLocation(for: url, root: root),
+            rootFolderName: rootFolder,
+            relativeLocation: relativePath,
             modifiedAt: modifiedAt,
             componentNames: componentNames,
-            packageExtension: url.pathExtension.lowercased()
+            packageExtension: url.pathExtension.lowercased(),
+            packageSizeBytes: packageSizeCache.byteCount(for: url, modificationDate: modifiedAt),
+            searchIndex: searchIndex
         )
     }
 

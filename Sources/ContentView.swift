@@ -7,77 +7,25 @@ struct ContentView: View {
     @AppStorage("pluginspector.sidebarWidth") private var storedSidebarWidth = 250.0
 
     @State private var searchText = ""
+    @State private var debouncedSearchText = ""
+    @State private var searchDebounceTask: Task<Void, Never>?
+    @State private var sidebarSearchText = ""
+    @State private var sortOption = PluginSortOption.nameAscending
     @State private var sidebarWidth: CGFloat = 250
     @State private var detailPlugin: PluginRecord?
     @State private var expandedGroups: Set<SidebarGroup> = [.manufacturer, .format, .folder]
     @State private var dragStartWidth: CGFloat?
     @State private var toast: ToastMessage?
+    @StateObject private var dashboard = DashboardSnapshotModel()
 
     private var theme: PrototypeTheme {
         PrototypeTheme(rawValue: themeKey) ?? .mint
-    }
-
-    private var filteredPlugins: [PluginRecord] {
-        let scopedPlugins: [PluginRecord]
-
-        switch library.selectedFilter {
-        case .all:
-            scopedPlugins = library.plugins
-        case .format(let format):
-            scopedPlugins = library.plugins.filter { $0.format == format }
-        case .vendor(let vendor):
-            scopedPlugins = library.plugins.filter { $0.displayVendor == vendor }
-        case .folder(let folder):
-            scopedPlugins = library.plugins.filter { $0.rootFolderName == folder }
-        }
-
-        let trimmedSearch = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedSearch.isEmpty else { return scopedPlugins }
-
-        return scopedPlugins.filter { plugin in
-            [
-                plugin.name,
-                plugin.displayVendor,
-                plugin.displayVersion,
-                plugin.relativeLocation,
-                plugin.rootFolderName,
-                plugin.bundleIdentifier ?? "",
-                plugin.componentSummary,
-            ].contains { value in
-                value.localizedCaseInsensitiveContains(trimmedSearch)
-            }
-        }
-    }
-
-    private var selectedPlugin: PluginRecord? {
-        library.selectedPlugin(in: filteredPlugins)
     }
 
     private var machineSubtitle: String {
         let host = Host.current().localizedName ?? "This Mac"
         let version = ProcessInfo.processInfo.operatingSystemVersion
         return "\(host) · macOS \(version.majorVersion).\(version.minorVersion).\(version.patchVersion)"
-    }
-
-    private var manufacturerCounts: [(String, Int)] {
-        groupedCounts(for: library.plugins.map(\.displayVendor))
-    }
-
-    private var folderCounts: [(String, Int)] {
-        groupedCounts(for: library.plugins.map(\.rootFolderName))
-    }
-
-    private var formatCounts: [(PluginFormat, Int)] {
-        PluginFormat.allCases
-            .filter { $0 != .other }
-            .map { format in
-                (format, library.plugins.filter { $0.format == format }.count)
-            }
-            .filter { $0.1 > 0 }
-    }
-
-    private var selectedCount: Int {
-        selectedPlugin == nil ? 0 : 1
     }
 
     private var topbarTitle: String {
@@ -92,7 +40,8 @@ struct ContentView: View {
             scanText = "Ready to scan your installed plugins"
         }
 
-        return "\(scanText) · \(filteredPlugins.count) plugin\(filteredPlugins.count == 1 ? "" : "s")"
+        let visibleCount = dashboard.snapshot.visibleCount
+        return "\(scanText) · \(visibleCount) plugin\(visibleCount == 1 ? "" : "s")"
     }
 
     var body: some View {
@@ -109,13 +58,18 @@ struct ContentView: View {
                         themeKey = nextTheme.rawValue
                     },
                     selectedFilter: library.selectedFilter,
+                    sidebarSearchText: $sidebarSearchText,
                     expandedGroups: expandedGroups,
-                    formatCounts: formatCounts,
-                    manufacturerCounts: manufacturerCounts,
-                    folderCounts: folderCounts,
-                    totalCount: library.plugins.count,
-                    visibleCount: filteredPlugins.count,
-                    selectedCount: selectedCount,
+                    manufacturerCounts: dashboard.snapshot.manufacturerCounts,
+                    folderCounts: dashboard.snapshot.folderCounts,
+                    filteredFormatCounts: dashboard.snapshot.filteredFormatCounts,
+                    filteredManufacturerCounts: dashboard.snapshot.filteredManufacturerCounts,
+                    filteredFolderCounts: dashboard.snapshot.filteredFolderCounts,
+                    hasSidebarMatches: dashboard.snapshot.hasSidebarMatches,
+                    totalCount: dashboard.snapshot.totalCount,
+                    visibleCount: dashboard.snapshot.visibleCount,
+                    selectedCount: dashboard.snapshot.selectedCount,
+                    totalPackageSizeDescription: dashboard.snapshot.totalPackageSizeDescription,
                     onToggleGroup: toggleGroup(_:),
                     onSelectFilter: { filter in
                         library.selectedFilter = filter
@@ -151,7 +105,11 @@ struct ContentView: View {
                     title: topbarTitle,
                     subtitle: topbarSubtitle,
                     searchText: $searchText,
-                    plugins: filteredPlugins,
+                    sortOption: $sortOption,
+                    plugins: dashboard.snapshot.filteredPlugins,
+                    visibleFormatCount: dashboard.snapshot.visibleFormatCount,
+                    visibleVendorCount: dashboard.snapshot.visibleVendorCount,
+                    selectedPlugin: dashboard.snapshot.selectedPlugin,
                     selectedPluginID: $library.selectedPluginID,
                     onSelectPlugin: { plugin in
                         library.selectedPluginID = plugin.id
@@ -204,8 +162,9 @@ struct ContentView: View {
             }
         }
         .task {
-            guard library.plugins.isEmpty else { return }
             sidebarWidth = clampedSidebarWidth(CGFloat(storedSidebarWidth))
+            rebuildSnapshot()
+            guard library.plugins.isEmpty else { return }
             library.scan()
         }
         .onAppear {
@@ -214,21 +173,52 @@ struct ContentView: View {
         .onChange(of: sidebarWidth) { newValue in
             storedSidebarWidth = Double(newValue)
         }
+        .onChange(of: library.plugins) { _ in
+            rebuildSnapshot()
+        }
+        .onChange(of: library.selectedFilter) { _ in
+            rebuildSnapshot()
+        }
+        .onChange(of: library.selectedPluginID) { _ in
+            rebuildSnapshot()
+        }
+        .onChange(of: sidebarSearchText) { _ in
+            rebuildSnapshot()
+        }
+        .onChange(of: sortOption) { _ in
+            rebuildSnapshot()
+        }
+        .onChange(of: searchText) { newValue in
+            searchDebounceTask?.cancel()
+            let pendingValue = newValue
+            searchDebounceTask = Task {
+                try? await Task.sleep(nanoseconds: 200_000_000)
+                guard !Task.isCancelled else { return }
+                await MainActor.run {
+                    debouncedSearchText = pendingValue
+                }
+            }
+        }
+        .onChange(of: debouncedSearchText) { _ in
+            rebuildSnapshot()
+        }
         .animation(.easeInOut(duration: 0.18), value: themeKey)
         .animation(.easeInOut(duration: 0.15), value: library.selectedFilter)
         .animation(.easeInOut(duration: 0.15), value: library.selectedPluginID)
+        .onDisappear {
+            searchDebounceTask?.cancel()
+        }
     }
 
-    private func groupedCounts(for values: [String]) -> [(String, Int)] {
-        Dictionary(values.map { ($0, 1) }, uniquingKeysWith: +)
-            .sorted { lhs, rhs in
-                if lhs.value == rhs.value {
-                    return lhs.key.localizedCaseInsensitiveCompare(rhs.key) == .orderedAscending
-                }
-
-                return lhs.value > rhs.value
-            }
-            .map { ($0.key, $0.value) }
+    private func rebuildSnapshot() {
+        dashboard.rebuild(
+            plugins: library.plugins,
+            selectedFilter: library.selectedFilter,
+            searchText: debouncedSearchText,
+            sidebarSearchText: sidebarSearchText,
+            sortOption: sortOption,
+            selectedPluginID: library.selectedPluginID
+        )
     }
 
     private func clampedSidebarWidth(_ proposed: CGFloat) -> CGFloat {
@@ -267,40 +257,49 @@ struct ContentView: View {
             .appendingPathComponent("Downloads", isDirectory: true)
             .appendingPathComponent(filename)
 
-        let rows = filteredPlugins.map { plugin in
-            [
-                plugin.name,
-                plugin.format.rawValue,
-                plugin.displayVendor,
-                plugin.displayVersion,
-                plugin.rootFolderName,
-                plugin.modifiedAt?.formatted(date: .numeric, time: .shortened) ?? "Unknown",
-                plugin.bundleIdentifier ?? "",
-                plugin.relativeLocation,
-            ]
-            .map(csvEscaped)
-            .joined(separator: ",")
-        }
+        let plugins = dashboard.snapshot.filteredPlugins
 
-        let csv = ([
-            "Name,Format,Vendor,Version,Folder,Modified,BundleIdentifier,Path",
-        ] + rows).joined(separator: "\n")
+        Task.detached(priority: .userInitiated) {
+            let rows = plugins.map { plugin in
+                [
+                    plugin.name,
+                    plugin.format.rawValue,
+                    plugin.displayVendor,
+                    plugin.displayVersion,
+                    "\(plugin.packageSizeBytes)",
+                    plugin.rootFolderName,
+                    plugin.modifiedAt?.formatted(date: .numeric, time: .shortened) ?? "Unknown",
+                    plugin.bundleIdentifier ?? "",
+                    plugin.relativeLocation,
+                ]
+                .map(ContentView.csvEscaped)
+                .joined(separator: ",")
+            }
 
-        do {
-            try csv.write(to: destination, atomically: true, encoding: .utf8)
-            NSWorkspace.shared.activateFileViewerSelecting([destination])
-            showToast("Exported report to Downloads.", color: theme.accent)
-        } catch {
-            showToast("Could not export report: \(error.localizedDescription)", color: ThemeTone.red.textColor(in: theme))
+            let csv = ([
+                "Name,Format,Vendor,Version,SizeBytes,Folder,Modified,BundleIdentifier,Path",
+            ] + rows).joined(separator: "\n")
+
+            do {
+                try csv.write(to: destination, atomically: true, encoding: .utf8)
+                await MainActor.run {
+                    NSWorkspace.shared.activateFileViewerSelecting([destination])
+                    showToast("Exported report to Downloads.", color: theme.accent)
+                }
+            } catch {
+                await MainActor.run {
+                    showToast("Could not export report: \(error.localizedDescription)", color: ThemeTone.red.textColor(in: theme))
+                }
+            }
         }
     }
 
-    private func csvEscaped(_ value: String) -> String {
+    private nonisolated static func csvEscaped(_ value: String) -> String {
         "\"\(value.replacingOccurrences(of: "\"", with: "\"\""))\""
     }
 
     private func revealSelectedPlugin() {
-        guard let selectedPlugin else {
+        guard let selectedPlugin = dashboard.snapshot.selectedPlugin else {
             showToast("Select a plugin first.", color: ThemeTone.orange.textColor(in: theme))
             return
         }
@@ -314,7 +313,7 @@ struct ContentView: View {
     }
 
     private func openSelectedPlugin() {
-        guard let selectedPlugin else {
+        guard let selectedPlugin = dashboard.snapshot.selectedPlugin else {
             showToast("Select a plugin first.", color: ThemeTone.orange.textColor(in: theme))
             return
         }
@@ -324,7 +323,7 @@ struct ContentView: View {
     }
 
     private func openDetailForSelectedPlugin() {
-        guard let selectedPlugin else {
+        guard let selectedPlugin = dashboard.snapshot.selectedPlugin else {
             showToast("Select a plugin first.", color: ThemeTone.orange.textColor(in: theme))
             return
         }
@@ -369,13 +368,18 @@ private struct SidebarPanel: View {
     let selectedTheme: PrototypeTheme
     let onSelectTheme: (PrototypeTheme) -> Void
     let selectedFilter: SidebarFilter
+    @Binding var sidebarSearchText: String
     let expandedGroups: Set<SidebarGroup>
-    let formatCounts: [(PluginFormat, Int)]
     let manufacturerCounts: [(String, Int)]
     let folderCounts: [(String, Int)]
+    let filteredFormatCounts: [(PluginFormat, Int)]
+    let filteredManufacturerCounts: [(String, Int)]
+    let filteredFolderCounts: [(String, Int)]
+    let hasSidebarMatches: Bool
     let totalCount: Int
     let visibleCount: Int
     let selectedCount: Int
+    let totalPackageSizeDescription: String
     let onToggleGroup: (SidebarGroup) -> Void
     let onSelectFilter: (SidebarFilter) -> Void
     let onOpenNotifications: () -> Void
@@ -402,73 +406,90 @@ private struct SidebarPanel: View {
 
                     SidebarSection(theme: theme, title: "Browse By") {
                         VStack(spacing: 10) {
-                            SidebarGroupView(
+                            SearchField(
                                 theme: theme,
-                                group: .manufacturer,
-                                isExpanded: expandedGroups.contains(.manufacturer),
-                                onToggle: { onToggleGroup(.manufacturer) }
-                            ) {
-                                VStack(spacing: 6) {
-                                    ForEach(manufacturerCounts, id: \.0) { vendor, count in
-                                        SidebarFilterButton(
-                                            theme: theme,
-                                            title: vendor,
-                                            subtitle: "Manufacturer",
-                                            count: count,
-                                            icon: "building.2",
-                                            isSelected: selectedFilter == .vendor(vendor),
-                                            compact: true
-                                        ) {
-                                            onSelectFilter(.vendor(vendor))
-                                        }
-                                    }
-                                }
-                            }
+                                placeholder: "Filter sidebar sections",
+                                text: $sidebarSearchText,
+                                compact: true
+                            )
 
-                            SidebarGroupView(
-                                theme: theme,
-                                group: .format,
-                                isExpanded: expandedGroups.contains(.format),
-                                onToggle: { onToggleGroup(.format) }
-                            ) {
-                                VStack(spacing: 6) {
-                                    ForEach(formatCounts, id: \.0.id) { format, count in
-                                        SidebarFilterButton(
-                                            theme: theme,
-                                            title: format.rawValue,
-                                            subtitle: "Plugin format",
-                                            count: count,
-                                            icon: format.systemIcon,
-                                            isSelected: selectedFilter == .format(format),
-                                            compact: true
-                                        ) {
-                                            onSelectFilter(.format(format))
+                            if sidebarSearchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || hasSidebarMatches {
+                                SidebarGroupView(
+                                    theme: theme,
+                                    group: .manufacturer,
+                                    isExpanded: expandedGroups.contains(.manufacturer),
+                                    onToggle: { onToggleGroup(.manufacturer) }
+                                ) {
+                                    VStack(spacing: 6) {
+                                        ForEach(filteredManufacturerCounts, id: \.0) { vendor, count in
+                                            SidebarFilterButton(
+                                                theme: theme,
+                                                title: vendor,
+                                                subtitle: "Manufacturer",
+                                                count: count,
+                                                icon: "building.2",
+                                                isSelected: selectedFilter == .vendor(vendor),
+                                                compact: true
+                                            ) {
+                                                onSelectFilter(.vendor(vendor))
+                                            }
                                         }
                                     }
                                 }
-                            }
 
-                            SidebarGroupView(
-                                theme: theme,
-                                group: .folder,
-                                isExpanded: expandedGroups.contains(.folder),
-                                onToggle: { onToggleGroup(.folder) }
-                            ) {
-                                VStack(spacing: 6) {
-                                    ForEach(folderCounts, id: \.0) { folder, count in
-                                        SidebarFilterButton(
-                                            theme: theme,
-                                            title: folder,
-                                            subtitle: "Scan folder",
-                                            count: count,
-                                            icon: "folder",
-                                            isSelected: selectedFilter == .folder(folder),
-                                            compact: true
-                                        ) {
-                                            onSelectFilter(.folder(folder))
+                                SidebarGroupView(
+                                    theme: theme,
+                                    group: .format,
+                                    isExpanded: expandedGroups.contains(.format),
+                                    onToggle: { onToggleGroup(.format) }
+                                ) {
+                                    VStack(spacing: 6) {
+                                        ForEach(filteredFormatCounts, id: \.0.id) { format, count in
+                                            SidebarFilterButton(
+                                                theme: theme,
+                                                title: format.rawValue,
+                                                subtitle: "Plugin format",
+                                                count: count,
+                                                icon: format.systemIcon,
+                                                isSelected: selectedFilter == .format(format),
+                                                compact: true
+                                            ) {
+                                                onSelectFilter(.format(format))
+                                            }
                                         }
                                     }
                                 }
+
+                                SidebarGroupView(
+                                    theme: theme,
+                                    group: .folder,
+                                    isExpanded: expandedGroups.contains(.folder),
+                                    onToggle: { onToggleGroup(.folder) }
+                                ) {
+                                    VStack(spacing: 6) {
+                                        ForEach(filteredFolderCounts, id: \.0) { folder, count in
+                                            SidebarFilterButton(
+                                                theme: theme,
+                                                title: folder,
+                                                subtitle: "Scan folder",
+                                                count: count,
+                                                icon: "folder",
+                                                isSelected: selectedFilter == .folder(folder),
+                                                compact: true
+                                            ) {
+                                                onSelectFilter(.folder(folder))
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                Text("No sidebar matches.")
+                                    .font(.system(size: 11, weight: .medium, design: .rounded))
+                                    .foregroundStyle(theme.textDim)
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 12)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .background(theme.surface2.opacity(0.5), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
                             }
                         }
                     }
@@ -580,6 +601,7 @@ private struct SidebarPanel: View {
             summaryRow(title: "Visible", value: "\(visibleCount)", accent: theme.accent)
             summaryRow(title: "Manufacturers", value: "\(manufacturerCounts.count)", accent: ThemeTone.teal.textColor(in: theme))
             summaryRow(title: "Folders", value: "\(folderCounts.count)", accent: ThemeTone.orange.textColor(in: theme))
+            summaryRow(title: "Disk usage", value: totalPackageSizeDescription, accent: ThemeTone.green.textColor(in: theme))
             summaryRow(title: "Selected", value: "\(selectedCount)", accent: ThemeTone.purple.textColor(in: theme))
         }
         .padding(14)
@@ -752,7 +774,11 @@ private struct MainPanel: View {
     let title: String
     let subtitle: String
     @Binding var searchText: String
+    @Binding var sortOption: PluginSortOption
     let plugins: [PluginRecord]
+    let visibleFormatCount: Int
+    let visibleVendorCount: Int
+    let selectedPlugin: PluginRecord?
     @Binding var selectedPluginID: PluginRecord.ID?
     let onSelectPlugin: (PluginRecord) -> Void
     let onExport: () -> Void
@@ -762,10 +788,6 @@ private struct MainPanel: View {
     let onOpenPluginDetails: (PluginRecord) -> Void
     let onRevealPlugin: (PluginRecord) -> Void
     let onRescan: () -> Void
-
-    private var selectedPlugin: PluginRecord? {
-        plugins.first(where: { $0.id == selectedPluginID })
-    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -809,11 +831,19 @@ private struct MainPanel: View {
 
     private var toolbarRow: some View {
         HStack(spacing: 12) {
-            SearchField(theme: theme, text: $searchText)
+            SearchField(
+                theme: theme,
+                placeholder: "Search plugins, vendors, paths, or component names",
+                text: $searchText
+            )
+            .frame(maxWidth: .infinity)
+
+            SortPicker(theme: theme, selection: $sortOption)
+                .frame(width: 200)
 
             CompactMetric(theme: theme, title: "Visible", value: "\(plugins.count)")
-            CompactMetric(theme: theme, title: "Formats", value: "\(Set(plugins.map(\.format.rawValue)).count)")
-            CompactMetric(theme: theme, title: "Vendors", value: "\(Set(plugins.map(\.displayVendor)).count)")
+            CompactMetric(theme: theme, title: "Formats", value: "\(visibleFormatCount)")
+            CompactMetric(theme: theme, title: "Vendors", value: "\(visibleVendorCount)")
         }
         .padding(.horizontal, 18)
         .padding(.vertical, 12)
@@ -875,15 +905,19 @@ private struct MainPanel: View {
 
 private struct SearchField: View {
     let theme: PrototypeTheme
+    let placeholder: String
     @Binding var text: String
+    var compact = false
 
     var body: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: compact ? 8 : 10) {
             Image(systemName: "magnifyingglass")
+                .font(.system(size: compact ? 11 : 12, weight: .medium))
                 .foregroundStyle(theme.textDim)
 
-            TextField("Search plugins, vendors, paths, or component names", text: $text)
+            TextField(placeholder, text: $text)
                 .textFieldStyle(.plain)
+                .font(.system(size: compact ? 11 : 12, weight: .medium, design: .rounded))
                 .foregroundStyle(theme.text)
 
             if !text.isEmpty {
@@ -891,19 +925,151 @@ private struct SearchField: View {
                     text = ""
                 } label: {
                     Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: compact ? 11 : 12, weight: .medium))
                         .foregroundStyle(theme.textDim)
                 }
                 .buttonStyle(.plain)
             }
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 10)
+        .padding(.horizontal, compact ? 10 : 12)
+        .padding(.vertical, compact ? 8 : 10)
         .background(theme.surface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: 10, style: .continuous)
                 .stroke(theme.border, lineWidth: 1)
         }
+        .onExitCommand {
+            guard !text.isEmpty else { return }
+            text = ""
+        }
     }
+}
+
+private struct SortPicker: View {
+    let theme: PrototypeTheme
+    @Binding var selection: PluginSortOption
+
+    var body: some View {
+        Picker(selection: $selection) {
+            ForEach(PluginSortOption.allCases) { option in
+                Text(option.title).tag(option)
+            }
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: "arrow.up.arrow.down")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(theme.textDim)
+
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Sort")
+                        .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                        .tracking(1.1)
+                        .foregroundStyle(theme.textDim)
+
+                    Text(selection.title)
+                        .font(.system(size: 11, weight: .medium, design: .rounded))
+                        .foregroundStyle(theme.text)
+                        .lineLimit(1)
+                }
+
+                Spacer(minLength: 8)
+
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(theme.textDim)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 9)
+            .background(theme.surface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .stroke(theme.border, lineWidth: 1)
+            }
+        }
+        .pickerStyle(.menu)
+    }
+}
+
+enum PluginSortOption: String, CaseIterable, Identifiable {
+    case nameAscending
+    case nameDescending
+    case dateNewest
+    case dateOldest
+    case sizeLargest
+    case sizeSmallest
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .nameAscending:
+            "Name A-Z"
+        case .nameDescending:
+            "Name Z-A"
+        case .dateNewest:
+            "Newest First"
+        case .dateOldest:
+            "Oldest First"
+        case .sizeLargest:
+            "Largest First"
+        case .sizeSmallest:
+            "Smallest First"
+        }
+    }
+
+    func sorted(_ plugins: [PluginRecord]) -> [PluginRecord] {
+        plugins.sorted { lhs, rhs in
+            switch self {
+            case .nameAscending:
+                return comparePluginNames(lhs, rhs, ascending: true)
+            case .nameDescending:
+                return comparePluginNames(lhs, rhs, ascending: false)
+            case .dateNewest:
+                return comparePluginDates(lhs, rhs, newestFirst: true)
+            case .dateOldest:
+                return comparePluginDates(lhs, rhs, newestFirst: false)
+            case .sizeLargest:
+                return comparePluginSizes(lhs, rhs, largestFirst: true)
+            case .sizeSmallest:
+                return comparePluginSizes(lhs, rhs, largestFirst: false)
+            }
+        }
+    }
+}
+
+private func comparePluginNames(_ lhs: PluginRecord, _ rhs: PluginRecord, ascending: Bool) -> Bool {
+    let nameComparison = lhs.name.localizedCaseInsensitiveCompare(rhs.name)
+    if nameComparison != .orderedSame {
+        return ascending ? nameComparison == .orderedAscending : nameComparison == .orderedDescending
+    }
+
+    let vendorComparison = lhs.displayVendor.localizedCaseInsensitiveCompare(rhs.displayVendor)
+    if vendorComparison != .orderedSame {
+        return vendorComparison == .orderedAscending
+    }
+
+    return lhs.path.localizedCaseInsensitiveCompare(rhs.path) == .orderedAscending
+}
+
+private func comparePluginDates(_ lhs: PluginRecord, _ rhs: PluginRecord, newestFirst: Bool) -> Bool {
+    switch (lhs.modifiedAt, rhs.modifiedAt) {
+    case let (left?, right?) where left != right:
+        return newestFirst ? left > right : left < right
+    case (_?, nil):
+        return true
+    case (nil, _?):
+        return false
+    default:
+        return comparePluginNames(lhs, rhs, ascending: true)
+    }
+}
+
+private func comparePluginSizes(_ lhs: PluginRecord, _ rhs: PluginRecord, largestFirst: Bool) -> Bool {
+    if lhs.packageSizeBytes != rhs.packageSizeBytes {
+        return largestFirst ? lhs.packageSizeBytes > rhs.packageSizeBytes : lhs.packageSizeBytes < rhs.packageSizeBytes
+    }
+
+    return comparePluginNames(lhs, rhs, ascending: true)
 }
 
 private struct CompactMetric: View {
@@ -975,6 +1141,14 @@ private struct PluginCard: View {
                     .font(.system(size: 10, weight: .medium, design: .monospaced))
                     .foregroundStyle(theme.textDim)
                     .lineLimit(1)
+
+                if isSelected {
+                    Text(expandedLine)
+                        .font(.system(size: 10, weight: .medium, design: .monospaced))
+                        .foregroundStyle(theme.textDim.opacity(0.92))
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
 
@@ -982,6 +1156,7 @@ private struct PluginCard: View {
                 HStack(spacing: 4) {
                     SmallTag(theme: theme, title: plugin.format.shortLabel, tone: .blue)
                     SmallTag(theme: theme, title: plugin.rootFolderName, tone: .gray)
+                    SmallTag(theme: theme, title: plugin.displaySize, tone: .green)
                     if let version = plugin.version {
                         SmallTag(theme: theme, title: "v\(version)", tone: .orange)
                     }
@@ -1007,6 +1182,11 @@ private struct PluginCard: View {
     private var metaLine: String {
         let dateText = plugin.modifiedAt?.formatted(date: .abbreviated, time: .omitted) ?? "Unknown date"
         return "\(plugin.relativeLocation) · \(plugin.displayVendor) · \(dateText)"
+    }
+
+    private var expandedLine: String {
+        let bundleID = plugin.bundleIdentifier ?? "Bundle ID not reported"
+        return "\(bundleID) · \(plugin.displaySize) · \(plugin.path)"
     }
 }
 
@@ -1214,6 +1394,7 @@ private struct DetailOverlay: View {
 
                 VStack(spacing: 0) {
                     detailRow("Version", plugin.displayVersion)
+                    detailRow("Package Size", plugin.displaySize)
                     detailRow("Bundle ID", plugin.bundleIdentifier ?? "Not reported")
                     detailRow("Executable", plugin.executableName ?? "Not reported")
                     detailRow("Minimum macOS", plugin.minimumSystemVersion ?? "Not reported")
