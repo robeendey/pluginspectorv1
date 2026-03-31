@@ -31,3 +31,4 @@ That creates shareable artifacts in `dist/`.
 - The app scans recursively inside `/Library/Audio/Plug-Ins`.
 - It is intentionally a browser prototype, not a mover/cleanup tool yet.
 - If you want the next step, we can add favorites, hide/archive rules, duplicate detection, or safe move-to-quarantine flows.
+test
