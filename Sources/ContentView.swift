@@ -7,8 +7,6 @@ struct ContentView: View {
     @AppStorage("pluginspector.sidebarWidth") private var storedSidebarWidth = 250.0
 
     @State private var searchText = ""
-    @State private var debouncedSearchText = ""
-    @State private var searchDebounceTask: Task<Void, Never>?
     @State private var sidebarSearchText = ""
     @State private var sortOption = PluginSortOption.nameAscending
     @State private var sidebarWidth: CGFloat = 250
@@ -107,6 +105,7 @@ struct ContentView: View {
                     searchText: $searchText,
                     sortOption: $sortOption,
                     plugins: dashboard.snapshot.filteredPlugins,
+                    multiFormatPluginIDs: dashboard.snapshot.multiFormatPluginIDs,
                     visibleFormatCount: dashboard.snapshot.visibleFormatCount,
                     visibleVendorCount: dashboard.snapshot.visibleVendorCount,
                     selectedPlugin: dashboard.snapshot.selectedPlugin,
@@ -188,33 +187,19 @@ struct ContentView: View {
         .onChange(of: sortOption) { _ in
             rebuildSnapshot()
         }
-        .onChange(of: searchText) { newValue in
-            searchDebounceTask?.cancel()
-            let pendingValue = newValue
-            searchDebounceTask = Task {
-                try? await Task.sleep(nanoseconds: 200_000_000)
-                guard !Task.isCancelled else { return }
-                await MainActor.run {
-                    debouncedSearchText = pendingValue
-                }
-            }
-        }
-        .onChange(of: debouncedSearchText) { _ in
+        .onChange(of: searchText) { _ in
             rebuildSnapshot()
         }
         .animation(.easeInOut(duration: 0.18), value: themeKey)
         .animation(.easeInOut(duration: 0.15), value: library.selectedFilter)
         .animation(.easeInOut(duration: 0.15), value: library.selectedPluginID)
-        .onDisappear {
-            searchDebounceTask?.cancel()
-        }
     }
 
     private func rebuildSnapshot() {
         dashboard.rebuild(
             plugins: library.plugins,
             selectedFilter: library.selectedFilter,
-            searchText: debouncedSearchText,
+            searchText: searchText,
             sidebarSearchText: sidebarSearchText,
             sortOption: sortOption,
             selectedPluginID: library.selectedPluginID
@@ -369,6 +354,7 @@ private struct SidebarPanel: View {
     let onSelectTheme: (PrototypeTheme) -> Void
     let selectedFilter: SidebarFilter
     @Binding var sidebarSearchText: String
+    @State private var manufacturerFilter: String = ""
     let expandedGroups: Set<SidebarGroup>
     let manufacturerCounts: [(String, Int)]
     let folderCounts: [(String, Int)]
@@ -384,6 +370,14 @@ private struct SidebarPanel: View {
     let onSelectFilter: (SidebarFilter) -> Void
     let onOpenNotifications: () -> Void
     let onScan: () -> Void
+
+    private var babyFilteredManufacturers: [(String, Int)] {
+        let trimmed = manufacturerFilter.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return filteredManufacturerCounts }
+        return filteredManufacturerCounts.filter {
+            $0.0.localizedCaseInsensitiveContains(trimmed)
+        }
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -421,7 +415,14 @@ private struct SidebarPanel: View {
                                     onToggle: { onToggleGroup(.manufacturer) }
                                 ) {
                                     VStack(spacing: 6) {
-                                        ForEach(filteredManufacturerCounts, id: \.0) { vendor, count in
+                                        // Baby Search — filters manufacturer names live
+                                        SearchField(
+                                            theme: theme,
+                                            placeholder: "Filter manufacturers…",
+                                            text: $manufacturerFilter,
+                                            compact: true
+                                        )
+                                        ForEach(babyFilteredManufacturers, id: \.0) { vendor, count in
                                             SidebarFilterButton(
                                                 theme: theme,
                                                 title: vendor,
@@ -776,6 +777,7 @@ private struct MainPanel: View {
     @Binding var searchText: String
     @Binding var sortOption: PluginSortOption
     let plugins: [PluginRecord]
+    let multiFormatPluginIDs: Set<PluginRecord.ID>
     let visibleFormatCount: Int
     let visibleVendorCount: Int
     let selectedPlugin: PluginRecord?
@@ -860,6 +862,7 @@ private struct MainPanel: View {
                         PluginCard(
                             theme: theme,
                             plugin: plugin,
+                            isMultiFormat: multiFormatPluginIDs.contains(plugin.id),
                             isSelected: selectedPluginID == plugin.id,
                             onSelect: {
                                 onSelectPlugin(plugin)
@@ -1101,6 +1104,7 @@ private struct CompactMetric: View {
 private struct PluginCard: View {
     let theme: PrototypeTheme
     let plugin: PluginRecord
+    let isMultiFormat: Bool
     let isSelected: Bool
     let onSelect: () -> Void
     let onDetails: () -> Void
@@ -1154,6 +1158,9 @@ private struct PluginCard: View {
 
             VStack(alignment: .trailing, spacing: 8) {
                 HStack(spacing: 4) {
+                    if isMultiFormat {
+                        SmallTag(theme: theme, title: "Multi-Format", tone: .purple)
+                    }
                     SmallTag(theme: theme, title: plugin.format.shortLabel, tone: .blue)
                     SmallTag(theme: theme, title: plugin.rootFolderName, tone: .gray)
                     SmallTag(theme: theme, title: plugin.displaySize, tone: .green)
